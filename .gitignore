@@ -1,0 +1,23 @@
+# Data files (too large for GitHub)
+data/DREAMER.mat
+
+# Results (generated at runtime)
+results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
