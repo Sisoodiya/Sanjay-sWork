@@ -1,5 +1,4 @@
-# Data files (too large for GitHub)
-data/DREAMER.mat
+# Data files (DREAMER.mat is tracked via Git LFS)
 
 # Results (generated at runtime)
 results/

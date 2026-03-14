@@ -54,7 +54,7 @@ EEG (128Hz, 14-ch)                          ECG (256Hz, 2-ch)
 ├── train.py                  # Entry point — LOSOCV training loop
 ├── requirements.txt          # Python dependencies
 ├── data/
-│   └── DREAMER.mat           # Dataset (not included — see below)
+│   └── DREAMER.mat           # Dataset (tracked via Git LFS)
 ├── results/                  # Output: model weights & confusion matrices
 ├── notebooks/
 │   └── emotion_recognition_colab.ipynb  # Google Colab notebook
@@ -85,7 +85,24 @@ pip install -r requirements.txt
 
 ### Data
 
-Place `DREAMER.mat` in the `data/` directory. The dataset is not included in this repo due to its size — obtain it from the [DREAMER dataset](https://zenodo.org/record/546113).
+`DREAMER.mat` (432 MB) is included in this repo via [Git LFS](https://git-lfs.github.com/). It will be downloaded automatically when you clone:
+
+```bash
+git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
+```
+
+If Git LFS is not installed, install it first:
+
+```bash
+# macOS
+brew install git-lfs
+
+# Ubuntu/Debian
+sudo apt install git-lfs
+
+# Then initialize
+git lfs install
+```
 
 ## Usage
 
@@ -110,9 +127,9 @@ python train.py --target valence --data /path/to/DREAMER.mat
 Open `notebooks/emotion_recognition_colab.ipynb` in Google Colab:
 
 1. Update `REPO_URL` with your GitHub repo URL
-2. Upload `DREAMER.mat` to Google Drive
-3. Update `DREAMER_DRIVE_PATH` to point to your file
-4. Run all cells (GPU runtime recommended)
+2. Run all cells (GPU runtime recommended)
+
+The dataset is pulled automatically from the repo via Git LFS during the clone step.
 
 ## Evaluation
 
