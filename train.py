@@ -8,6 +8,7 @@ Run from project root:
 """
 
 import os
+import gc
 import argparse
 import numpy as np
 import tensorflow as tf
@@ -123,14 +124,19 @@ def losocv_train(dataset, target="valence", num_subjects=None, save_dir=None):
         # Apply 2D transforms
         print("  Transforming training data...")
         train_eeg_2d, train_ecg_2d = apply_transforms(train_eeg, train_ecg)
+        del train_eeg, train_ecg  # Free raw segments (~21 subjects)
         print("  Transforming validation data...")
         val_eeg_2d, val_ecg_2d = apply_transforms(val_eeg, val_ecg)
+        del val_eeg, val_ecg
         print("  Transforming test data...")
         test_eeg_2d, test_ecg_2d = apply_transforms(test_eeg, test_ecg)
+        del test_eeg, test_ecg
+        gc.collect()  # Force garbage collection to reclaim freed memory
 
         # One-hot encode labels
         train_labels_oh = to_categorical(train_labels, config.NUM_CLASSES)
         val_labels_oh = to_categorical(val_labels, config.NUM_CLASSES)
+        test_labels_oh = to_categorical(test_labels, config.NUM_CLASSES)
 
         # Data augmentation (training data only)
         n_before = len(train_labels_oh)
@@ -138,7 +144,6 @@ def losocv_train(dataset, target="valence", num_subjects=None, save_dir=None):
             train_eeg_2d, train_ecg_2d, train_labels_oh,
         )
         print(f"  Augmentation: {n_before} → {len(train_labels_oh)} training segments")
-        test_labels_oh = to_categorical(test_labels, config.NUM_CLASSES)
 
         # Class weights
         class_weights = get_class_weights(train_labels)
@@ -212,8 +217,13 @@ def losocv_train(dataset, target="valence", num_subjects=None, save_dir=None):
         # Save model weights for this fold
         model.save_weights(os.path.join(save_dir, f"model_fold_{fold}.weights.h5"))
 
-        # Clear session to free memory
+        # Clear session and free memory
+        del train_eeg_2d, train_ecg_2d, train_labels_oh
+        del val_eeg_2d, val_ecg_2d, val_labels_oh
+        del test_eeg_2d, test_ecg_2d, test_labels_oh
+        del model
         tf.keras.backend.clear_session()
+        gc.collect()
 
     # Overall results
     all_y_true = np.array(all_y_true)

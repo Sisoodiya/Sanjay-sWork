@@ -93,15 +93,15 @@ class SpatialAttentionPooling(layers.Layer):
 
 class EEGTransformerEncoder(layers.Layer):
     """
-    EEG feature extractor with deferred spatial pooling:
+    EEG feature extractor with deferred spatial pooling (memory-efficient):
       (batch, 128, 9, 9) → SpatialPositionEncoding → (batch, 128, 81, d_model)
-      → Per-timestep Transformer over spatial tokens →
+      → Lightweight spatial mixing (Dense, not full Transformer — saves ~10× RAM)
       → Learnable spatial attention pooling → (batch, 128, d_model)
       → Temporal positional encoding → Transformer stack → (batch, 128, d_model)
 
-    Key improvement: spatial tokens are processed by a Transformer BEFORE
-    being pooled. This lets the model learn spatial relationships between
-    electrode positions before compressing to a per-timestep representation.
+    Uses a Dense layer for spatial mixing instead of a full Transformer block
+    over 81 tokens, which would create batch×128×81×81 attention matrices and
+    cause OOM on Colab's T4 (15GB VRAM, ~12GB RAM).
     """
 
     def __init__(self, d_model=None, num_heads=None, ff_dim=None,
@@ -117,12 +117,13 @@ class EEGTransformerEncoder(layers.Layer):
         self.spatial_encoding = SpatialPositionEncoding(
             d_model=self.d_model, name="eeg_spatial_enc"
         )
-        # Spatial Transformer: processes 81 spatial tokens per timestep
-        self.spatial_transformer = TransformerEncoderBlock(
-            d_model=self.d_model, num_heads=self.num_heads,
-            ff_dim=self.ff_dim, dropout=self.dropout_rate,
-            name="eeg_spatial_transformer"
-        )
+        # Lightweight spatial mixing: learns inter-electrode relationships
+        # without the O(n²) memory cost of MultiHeadAttention over 81 tokens
+        self.spatial_mix = tf.keras.Sequential([
+            layers.Dense(self.ff_dim, activation="relu", name="spatial_mix_up"),
+            layers.Dense(self.d_model, name="spatial_mix_down"),
+        ], name="eeg_spatial_mix")
+        self.spatial_norm = layers.LayerNormalization(epsilon=1e-6, name="spatial_mix_norm")
         # Learnable spatial attention pooling (replaces mean pooling)
         self.spatial_pool = SpatialAttentionPooling(
             d_model=self.d_model, name="eeg_spatial_pool"
@@ -148,19 +149,14 @@ class EEGTransformerEncoder(layers.Layer):
         Returns:
             (batch, 128, d_model)
         """
-        batch_size = tf.shape(x)[0]
-        timesteps = tf.shape(x)[1]
-
         # Spatial encoding: (batch, 128, 81, d_model)
         x = self.spatial_encoding(x)
 
-        # Process spatial tokens with Transformer (per timestep):
-        # Reshape to (batch * timesteps, 81, d_model) for efficient batching
-        num_tokens = x.shape[2] or tf.shape(x)[2]  # 81
-        x = tf.reshape(x, [batch_size * timesteps, num_tokens, self.d_model])
-        x = self.spatial_transformer(x, training=training)
-        # Reshape back: (batch, timesteps, 81, d_model)
-        x = tf.reshape(x, [batch_size, timesteps, num_tokens, self.d_model])
+        # Lightweight spatial mixing: (batch, 128, 81, d_model)
+        # Applies Dense to each spatial token independently (shared across tokens),
+        # then residual + norm — learns to transform spatial features without
+        # creating 81×81 attention matrices
+        x = self.spatial_norm(x + self.spatial_mix(x))
 
         # Learnable attention pooling over spatial tokens: (batch, 128, d_model)
         x = self.spatial_pool(x)

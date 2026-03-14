@@ -283,6 +283,9 @@ def transform_ecg_batch(ecg_segments, image_size=None):
     """
     Apply 2D transforms to a batch of ECG segments using GPU if available.
 
+    Processes in chunks of config.TRANSFORM_BATCH_SIZE to cap peak RAM
+    usage (important on Colab with ~12GB system RAM).
+
     Args:
         ecg_segments: (N, 256, 2) array.
         image_size: Output spatial resolution.
@@ -291,17 +294,29 @@ def transform_ecg_batch(ecg_segments, image_size=None):
     """
     if image_size is None:
         image_size = config.ECG_IMAGE_SIZE
-    xp = get_xp()
-    segs = xp.asarray(ecg_segments)
+    N = ecg_segments.shape[0]
+    chunk_size = config.TRANSFORM_BATCH_SIZE
 
-    all_channels = []
-    for ch in range(segs.shape[2]):
-        ch_data = segs[:, :, ch]  # (N, 256)
-        all_channels.append(_batch_gaf(ch_data, image_size, xp))
-        all_channels.append(_batch_rp(ch_data, image_size, 0.1, xp))
-        all_channels.append(_batch_mtf(ch_data, image_size, 8, xp))
+    # Pre-allocate output array
+    result = np.empty((N, image_size, image_size, 6), dtype=np.float32)
 
-    return to_numpy(xp.stack(all_channels, axis=-1)).astype(np.float32)
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        xp = get_xp()
+        segs = xp.asarray(ecg_segments[start:end])
+
+        all_channels = []
+        for ch in range(segs.shape[2]):
+            ch_data = segs[:, :, ch]  # (chunk, 256)
+            all_channels.append(_batch_gaf(ch_data, image_size, xp))
+            all_channels.append(_batch_rp(ch_data, image_size, 0.1, xp))
+            all_channels.append(_batch_mtf(ch_data, image_size, 8, xp))
+
+        chunk_result = to_numpy(xp.stack(all_channels, axis=-1)).astype(np.float32)
+        result[start:end] = chunk_result
+        del segs, all_channels, chunk_result  # Free chunk memory
+
+    return result
 
 
 def transform_eeg_batch(eeg_segments, grid_size=None):

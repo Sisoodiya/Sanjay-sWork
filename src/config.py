@@ -63,6 +63,7 @@ EEG_GRID_MAP = {
 # ── ECG 2D Image ──────────────────────────────────────────────────────────────
 ECG_IMAGE_SIZE = 64    # Output resolution for GAF/RP/MTF images
 ECG_IMAGE_CHANNELS = 6 # 2 ECG channels × 3 transforms (GAF, RP, MTF)
+TRANSFORM_BATCH_SIZE = 500  # Process ECG transforms in chunks to cap peak RAM
 
 # ── Transformer Config ────────────────────────────────────────────────────────
 D_MODEL = 64
@@ -84,7 +85,7 @@ REDUCE_LR_FACTOR = 0.5
 RANDOM_SEED = 42
 
 # ── Data Augmentation ────────────────────────────────────────────────────────
-AUG_RATIO = 0.5             # Augment 50% extra copies of training data
+AUG_RATIO = 0.3             # Augment 30% extra copies of training data
 AUG_TIME_SHIFT_MAX = 10     # Max circular shift in time steps (EEG only)
 AUG_NOISE_STD = 0.01        # Gaussian noise standard deviation
 AUG_CHANNEL_DROP_PROB = 0.1 # Per-channel dropout probability (EEG only)
