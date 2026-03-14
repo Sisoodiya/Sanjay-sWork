@@ -1,6 +1,8 @@
 """
 Phase 1: Signal preprocessing — filtering, ICA artifact removal,
 last-60s extraction, and 1-second segmentation.
+
+Uses CuPy for GPU-accelerated filtering when available.
 """
 
 import warnings
@@ -11,6 +13,26 @@ from sklearn.decomposition import FastICA
 
 from src import config
 from src.data_loader import load_all_subjects, get_labels
+from src.utils import get_xp, to_numpy
+
+# Try to import CuPy's filtfilt for GPU filtering
+try:
+    from cupyx.scipy.signal import filtfilt as cu_filtfilt
+    _HAS_CU_FILTFILT = True
+except ImportError:
+    _HAS_CU_FILTFILT = False
+
+
+def _gpu_filtfilt(b, a, signal):
+    """Run filtfilt on GPU if cupy is available, else CPU."""
+    xp = get_xp()
+    if _HAS_CU_FILTFILT and xp.__name__ == 'cupy':
+        sig_gpu = xp.asarray(signal)
+        b_gpu = xp.asarray(b)
+        a_gpu = xp.asarray(a)
+        result = cu_filtfilt(b_gpu, a_gpu, sig_gpu, axis=0)
+        return to_numpy(result)
+    return filtfilt(b, a, signal, axis=0)
 
 
 # ── Filters ───────────────────────────────────────────────────────────────────
@@ -28,7 +50,7 @@ def notch_filter(signal, fs, freq=50.0, quality=30.0):
         Filtered signal, same shape.
     """
     b, a = iirnotch(freq, quality, fs)
-    return filtfilt(b, a, signal, axis=0)
+    return _gpu_filtfilt(b, a, signal)
 
 
 def bandpass_filter(signal, fs, low=0.5, high=45.0, order=4):
@@ -46,7 +68,7 @@ def bandpass_filter(signal, fs, low=0.5, high=45.0, order=4):
     """
     nyq = fs / 2.0
     b, a = butter(order, [low / nyq, high / nyq], btype="band")
-    return filtfilt(b, a, signal, axis=0)
+    return _gpu_filtfilt(b, a, signal)
 
 
 def apply_ica(signal, n_components=None):

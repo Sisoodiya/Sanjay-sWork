@@ -2,136 +2,133 @@
 Phase 1: 1D → 2D signal transformations.
   - ECG: Gramian Angular Field (GAF), Recurrence Plot (RP), Markov Transition Field (MTF)
   - EEG: 14-channel → 9×9 spatial grid mapping
+
+Uses CuPy for GPU acceleration when available, falls back to NumPy.
 """
 
 import numpy as np
-from scipy.spatial.distance import pdist, squareform
 
 from src import config
+from src.utils import get_xp, to_numpy
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ECG 2D Transforms
+# Helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _normalize_minmax(x):
+def _normalize_minmax(x, xp):
     """Normalize signal to [-1, 1]."""
     x_min, x_max = x.min(), x.max()
-    if x_max - x_min < 1e-8:
-        return np.zeros_like(x)
+    if float(x_max - x_min) < 1e-8:
+        return xp.zeros_like(x)
     return 2 * (x - x_min) / (x_max - x_min) - 1
 
 
-def _resize_signal(signal, target_len):
+def _resize_signal(signal, target_len, xp):
     """Downsample/upsample signal to target_len using linear interpolation."""
     original_len = len(signal)
     if original_len == target_len:
         return signal
-    x_original = np.linspace(0, 1, original_len)
-    x_target = np.linspace(0, 1, target_len)
-    return np.interp(x_target, x_original, signal)
+    x_original = xp.linspace(0, 1, original_len)
+    x_target = xp.linspace(0, 1, target_len)
+    return xp.interp(x_target, x_original, signal)
 
 
-def gramian_angular_field(signal_1d, image_size=None):
+# ══════════════════════════════════════════════════════════════════════════════
+# ECG 2D Transforms (single-segment)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def gramian_angular_field(signal_1d, image_size=None, xp=None):
     """
     Compute Gramian Angular Summation Field (GASF).
-
-    The signal is normalized to [-1, 1], converted to angular representation
-    via arccos, then the outer sum of angles forms the 2D image.
 
     Args:
         signal_1d: 1D array of length N.
         image_size: Output image size (default: config.ECG_IMAGE_SIZE).
+        xp: Array backend (cupy or numpy).
     Returns:
         (image_size, image_size) array.
     """
+    if xp is None:
+        xp = get_xp()
     if image_size is None:
         image_size = config.ECG_IMAGE_SIZE
-    # Resize to target image size
-    x = _resize_signal(signal_1d, image_size)
-    # Normalize to [-1, 1]
-    x = _normalize_minmax(x)
-    # Clamp for numerical safety
-    x = np.clip(x, -1, 1)
-    # Angular representation
-    phi = np.arccos(x)
-    # GASF: cos(phi_i + phi_j)
-    gasf = np.cos(np.add.outer(phi, phi))
+    x = _resize_signal(signal_1d, image_size, xp)
+    x = _normalize_minmax(x, xp)
+    x = xp.clip(x, -1, 1)
+    phi = xp.arccos(x)
+    gasf = xp.cos(xp.add.outer(phi, phi))
     return gasf
 
 
-def recurrence_plot(signal_1d, image_size=None, threshold=None):
+def recurrence_plot(signal_1d, image_size=None, threshold=None, xp=None):
     """
     Compute a Recurrence Plot from a 1D signal.
-
-    Uses time-delay embedding (tau=1, dim=1 for simplicity) and a distance
-    threshold to create a binary recurrence matrix.
 
     Args:
         signal_1d: 1D array of length N.
         image_size: Output image size (default: config.ECG_IMAGE_SIZE).
         threshold: Distance threshold. If None, uses 10% of max distance.
+        xp: Array backend (cupy or numpy).
     Returns:
         (image_size, image_size) array with values in [0, 1].
     """
+    if xp is None:
+        xp = get_xp()
     if image_size is None:
         image_size = config.ECG_IMAGE_SIZE
-    x = _resize_signal(signal_1d, image_size)
-    # Compute pairwise distances
-    x_col = x.reshape(-1, 1)
-    dist_matrix = squareform(pdist(x_col, metric="euclidean"))
-    # Normalize distances
+    x = _resize_signal(signal_1d, image_size, xp)
+    # Vectorized pairwise absolute difference
+    dist_matrix = xp.abs(x[:, None] - x[None, :])
     max_dist = dist_matrix.max()
-    if max_dist > 1e-8:
+    if float(max_dist) > 1e-8:
         dist_matrix = dist_matrix / max_dist
     if threshold is None:
         threshold = 0.1
-    # Binary recurrence: 1 if distance < threshold, else 0
-    rp = (dist_matrix < threshold).astype(np.float64)
+    rp = (dist_matrix < threshold).astype(xp.float32)
     return rp
 
 
-def markov_transition_field(signal_1d, image_size=None, n_bins=8):
+def markov_transition_field(signal_1d, image_size=None, n_bins=8, xp=None):
     """
     Compute a Markov Transition Field (MTF) from a 1D signal.
 
-    Quantizes the signal into bins, computes the transition probability matrix,
-    and maps time-indexed transitions back to a 2D image.
+    Uses fully vectorized indexing instead of nested loops.
 
     Args:
         signal_1d: 1D array of length N.
         image_size: Output image size (default: config.ECG_IMAGE_SIZE).
         n_bins: Number of quantile bins.
+        xp: Array backend (cupy or numpy).
     Returns:
         (image_size, image_size) array.
     """
+    if xp is None:
+        xp = get_xp()
     if image_size is None:
         image_size = config.ECG_IMAGE_SIZE
-    x = _resize_signal(signal_1d, image_size)
+    x = _resize_signal(signal_1d, image_size, xp)
 
-    # Quantize into bins using quantile boundaries
-    x_min, x_max = x.min(), x.max()
+    x_min, x_max = float(x.min()), float(x.max())
     if x_max - x_min < 1e-8:
-        return np.zeros((image_size, image_size))
-    bins = np.linspace(x_min, x_max, n_bins + 1)
-    # Digitize: assign each sample to a bin (0 to n_bins-1)
-    binned = np.clip(np.digitize(x, bins) - 1, 0, n_bins - 1)
+        return xp.zeros((image_size, image_size), dtype=xp.float32)
+    bins = xp.linspace(x_min, x_max, n_bins + 1)
+    binned = xp.clip(xp.digitize(x, bins) - 1, 0, n_bins - 1)
 
-    # Compute transition matrix
-    transition_matrix = np.zeros((n_bins, n_bins))
-    for i in range(len(binned) - 1):
-        transition_matrix[binned[i], binned[i + 1]] += 1
-    # Normalize rows to get probabilities
+    # Transition matrix
+    transition_matrix = xp.zeros((n_bins, n_bins), dtype=xp.float32)
+    from_bins = binned[:-1]
+    to_bins = binned[1:]
+    if xp.__name__ == 'cupy':
+        xp.add.at(transition_matrix, (from_bins, to_bins), 1)
+    else:
+        np.add.at(transition_matrix, (from_bins.astype(int), to_bins.astype(int)), 1)
     row_sums = transition_matrix.sum(axis=1, keepdims=True)
-    row_sums[row_sums == 0] = 1
+    row_sums = xp.where(row_sums == 0, 1, row_sums)
     transition_matrix = transition_matrix / row_sums
 
-    # Build MTF: M[i,j] = transition probability from bin(x[i]) to bin(x[j])
-    mtf = np.zeros((image_size, image_size))
-    for i in range(image_size):
-        for j in range(image_size):
-            mtf[i, j] = transition_matrix[binned[i], binned[j]]
-
+    # Vectorized MTF: index with outer product of binned indices
+    mtf = transition_matrix[binned[:, None], binned[None, :]]
     return mtf
 
 
@@ -146,18 +143,20 @@ def ecg_to_2d(ecg_segment, image_size=None):
         ecg_segment: (256, 2) array — one 1s ECG segment.
         image_size: Output spatial resolution.
     Returns:
-        (image_size, image_size, 6) array.
+        (image_size, image_size, 6) numpy array.
     """
     if image_size is None:
         image_size = config.ECG_IMAGE_SIZE
+    xp = get_xp()
+    seg = xp.asarray(ecg_segment)
     channels = []
-    for ch in range(ecg_segment.shape[1]):
-        sig = ecg_segment[:, ch]
-        channels.append(gramian_angular_field(sig, image_size))
-        channels.append(recurrence_plot(sig, image_size))
-        channels.append(markov_transition_field(sig, image_size))
-    # Stack: (image_size, image_size, 6)
-    return np.stack(channels, axis=-1)
+    for ch in range(seg.shape[1]):
+        sig = seg[:, ch]
+        channels.append(gramian_angular_field(sig, image_size, xp))
+        channels.append(recurrence_plot(sig, image_size, xp=xp))
+        channels.append(markov_transition_field(sig, image_size, xp=xp))
+    result = xp.stack(channels, axis=-1)
+    return to_numpy(result)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -190,25 +189,100 @@ def eeg_to_2d_grid(eeg_segment, grid_size=None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Batch Transform
+# Batch Transforms (GPU-accelerated)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _batch_gaf(signals, image_size, xp):
+    """Batched GAF: (N, signal_len) -> (N, image_size, image_size)."""
+    # Resize all signals
+    N = signals.shape[0]
+    x_orig = xp.linspace(0, 1, signals.shape[1])
+    x_tgt = xp.linspace(0, 1, image_size)
+    resized = xp.array([xp.interp(x_tgt, x_orig, signals[i]) for i in range(N)])
+    # Normalize each to [-1, 1]
+    mins = resized.min(axis=1, keepdims=True)
+    maxs = resized.max(axis=1, keepdims=True)
+    rng = maxs - mins
+    rng = xp.where(rng < 1e-8, 1.0, rng)
+    normed = 2 * (resized - mins) / rng - 1
+    normed = xp.clip(normed, -1, 1)
+    phi = xp.arccos(normed)  # (N, image_size)
+    # Batched outer sum: (N, image_size, 1) + (N, 1, image_size)
+    gasf = xp.cos(phi[:, :, None] + phi[:, None, :])
+    return gasf
+
+
+def _batch_rp(signals, image_size, threshold, xp):
+    """Batched RP: (N, signal_len) -> (N, image_size, image_size)."""
+    N = signals.shape[0]
+    x_orig = xp.linspace(0, 1, signals.shape[1])
+    x_tgt = xp.linspace(0, 1, image_size)
+    resized = xp.array([xp.interp(x_tgt, x_orig, signals[i]) for i in range(N)])
+    # Batched pairwise distance: |x_i - x_j|
+    dist = xp.abs(resized[:, :, None] - resized[:, None, :])  # (N, S, S)
+    max_dist = dist.reshape(N, -1).max(axis=1)[:, None, None]
+    max_dist = xp.where(max_dist < 1e-8, 1.0, max_dist)
+    dist = dist / max_dist
+    rp = (dist < threshold).astype(xp.float32)
+    return rp
+
+
+def _batch_mtf(signals, image_size, n_bins, xp):
+    """Batched MTF: (N, signal_len) -> (N, image_size, image_size)."""
+    N = signals.shape[0]
+    x_orig = xp.linspace(0, 1, signals.shape[1])
+    x_tgt = xp.linspace(0, 1, image_size)
+    resized = xp.array([xp.interp(x_tgt, x_orig, signals[i]) for i in range(N)])
+
+    results = xp.zeros((N, image_size, image_size), dtype=xp.float32)
+    for i in range(N):
+        x = resized[i]
+        x_min, x_max = float(x.min()), float(x.max())
+        if x_max - x_min < 1e-8:
+            continue
+        bins = xp.linspace(x_min, x_max, n_bins + 1)
+        binned = xp.clip(xp.digitize(x, bins) - 1, 0, n_bins - 1)
+
+        tm = xp.zeros((n_bins, n_bins), dtype=xp.float32)
+        fb, tb = binned[:-1], binned[1:]
+        if xp.__name__ == 'cupy':
+            xp.add.at(tm, (fb, tb), 1)
+        else:
+            np.add.at(tm, (fb.astype(int), tb.astype(int)), 1)
+        row_sums = tm.sum(axis=1, keepdims=True)
+        row_sums = xp.where(row_sums == 0, 1, row_sums)
+        tm = tm / row_sums
+        results[i] = tm[binned[:, None], binned[None, :]]
+    return results
+
 
 def transform_ecg_batch(ecg_segments, image_size=None):
     """
-    Apply 2D transform to a batch of ECG segments.
+    Apply 2D transforms to a batch of ECG segments using GPU if available.
 
     Args:
         ecg_segments: (N, 256, 2) array.
         image_size: Output spatial resolution.
     Returns:
-        (N, image_size, image_size, 6) array.
+        (N, image_size, image_size, 6) numpy array.
     """
     if image_size is None:
         image_size = config.ECG_IMAGE_SIZE
-    results = []
-    for i in range(len(ecg_segments)):
-        results.append(ecg_to_2d(ecg_segments[i], image_size))
-    return np.array(results, dtype=np.float32)
+    xp = get_xp()
+    segs = xp.asarray(ecg_segments)
+    N = segs.shape[0]
+
+    all_channels = []
+    for ch in range(segs.shape[2]):
+        ch_data = segs[:, :, ch]  # (N, 256)
+        gaf = _batch_gaf(ch_data, image_size, xp)
+        rp = _batch_rp(ch_data, image_size, 0.1, xp)
+        mtf = _batch_mtf(ch_data, image_size, 8, xp)
+        all_channels.extend([gaf, rp, mtf])
+
+    # Stack: list of 6x (N, S, S) -> (N, S, S, 6)
+    result = xp.stack(all_channels, axis=-1)
+    return to_numpy(result).astype(np.float32)
 
 
 def transform_eeg_batch(eeg_segments, grid_size=None):
@@ -219,37 +293,44 @@ def transform_eeg_batch(eeg_segments, grid_size=None):
         eeg_segments: (N, 128, 14) array.
         grid_size: Grid dimension.
     Returns:
-        (N, 128, grid_size, grid_size) array.
+        (N, 128, grid_size, grid_size) numpy array.
     """
     if grid_size is None:
         grid_size = config.EEG_GRID_SIZE
-    results = []
-    for i in range(len(eeg_segments)):
-        results.append(eeg_to_2d_grid(eeg_segments[i], grid_size))
-    return np.array(results, dtype=np.float32)
+    segs = np.asarray(eeg_segments)
+    N, T, _ = segs.shape
+    grid = np.zeros((N, T, grid_size, grid_size), dtype=np.float32)
+
+    for ch_idx, (row, col) in config.EEG_GRID_MAP.items():
+        grid[:, :, row, col] = segs[:, :, ch_idx]
+
+    return grid
 
 
 if __name__ == "__main__":
+    from src.utils import HAS_CUPY
+    print(f"CuPy available: {HAS_CUPY}")
+
     # Quick test with synthetic data
     print("Testing ECG 2D transforms...")
     ecg_seg = np.random.randn(256, 2)
     ecg_2d = ecg_to_2d(ecg_seg)
-    print(f"  ECG input: {ecg_seg.shape} → ECG 2D output: {ecg_2d.shape}")
+    print(f"  ECG input: {ecg_seg.shape} -> ECG 2D output: {ecg_2d.shape}")
     assert ecg_2d.shape == (64, 64, 6), f"Expected (64,64,6), got {ecg_2d.shape}"
 
     print("Testing EEG 2D grid transform...")
     eeg_seg = np.random.randn(128, 14)
     eeg_2d = eeg_to_2d_grid(eeg_seg)
-    print(f"  EEG input: {eeg_seg.shape} → EEG 2D output: {eeg_2d.shape}")
+    print(f"  EEG input: {eeg_seg.shape} -> EEG 2D output: {eeg_2d.shape}")
     assert eeg_2d.shape == (128, 9, 9), f"Expected (128,9,9), got {eeg_2d.shape}"
 
     print("Testing batch transforms...")
     ecg_batch = np.random.randn(5, 256, 2)
     ecg_batch_2d = transform_ecg_batch(ecg_batch)
-    print(f"  ECG batch: {ecg_batch.shape} → {ecg_batch_2d.shape}")
+    print(f"  ECG batch: {ecg_batch.shape} -> {ecg_batch_2d.shape}")
 
     eeg_batch = np.random.randn(5, 128, 14)
     eeg_batch_2d = transform_eeg_batch(eeg_batch)
-    print(f"  EEG batch: {eeg_batch.shape} → {eeg_batch_2d.shape}")
+    print(f"  EEG batch: {eeg_batch.shape} -> {eeg_batch_2d.shape}")
 
     print("All transform tests passed!")

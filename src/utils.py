@@ -6,6 +6,28 @@ import os
 import random
 import numpy as np
 
+# ── CuPy / NumPy backend ────────────────────────────────────────────────────
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    cp = None
+    HAS_CUPY = False
+
+
+def get_xp():
+    """Return cupy if available (and GPU present), else numpy."""
+    if HAS_CUPY and cp.cuda.runtime.getDeviceCount() > 0:
+        return cp
+    return np
+
+
+def to_numpy(x):
+    """Convert cupy array to numpy if needed."""
+    if HAS_CUPY and isinstance(x, cp.ndarray):
+        return cp.asnumpy(x)
+    return np.asarray(x)
+
 
 def set_seed(seed=42):
     """Set random seed for reproducibility across all libraries."""
