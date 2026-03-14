@@ -14,6 +14,14 @@ except ImportError:
     cp = None
     HAS_CUPY = False
 
+# ── cuML (RAPIDS GPU ICA) ───────────────────────────────────────────────────
+try:
+    from cuml.decomposition import FastICA as CuMLFastICA
+    HAS_CUML = True
+except ImportError:
+    CuMLFastICA = None
+    HAS_CUML = False
+
 
 def get_xp():
     """Return cupy if available (and GPU present), else numpy."""

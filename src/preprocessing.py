@@ -2,20 +2,23 @@
 Phase 1: Signal preprocessing — filtering, ICA artifact removal,
 last-60s extraction, and 1-second segmentation.
 
-Uses CuPy for GPU-accelerated filtering when available.
-Subjects are preprocessed in parallel via joblib.
+Uses CuPy for GPU-accelerated filtering and cuML for GPU ICA when available.
+Preprocessed datasets are cached to disk for instant reload.
 """
 
+import os
 import warnings
 
 import numpy as np
 from scipy.signal import iirnotch, butter, filtfilt
 from sklearn.decomposition import FastICA
-from joblib import Parallel, delayed
 
 from src import config
 from src.data_loader import load_all_subjects, get_labels
-from src.utils import to_numpy
+from src.utils import to_numpy, HAS_CUML
+
+if HAS_CUML:
+    from cuml.decomposition import FastICA as CuMLFastICA
 
 # ── GPU filtfilt decision resolved once at import time ───────────────────────
 try:
@@ -24,6 +27,9 @@ try:
 except ImportError:
     cu_filtfilt = None
     _USE_GPU_FILTFILT = False
+
+# ── Cache path ───────────────────────────────────────────────────────────────
+CACHE_PATH = os.path.join(config.BASE_DIR, "data", "preprocessed_cache.npz")
 
 
 def _gpu_filtfilt(b, a, signal):
@@ -75,9 +81,8 @@ def apply_ica(signal, n_components=None):
     """
     Apply ICA for artifact removal (eye blinks, muscle activity).
 
-    Uses the parallel algorithm (3-5x faster than deflation).
-    Partial convergence is acceptable — the dominant artifact component
-    is still identified.
+    Uses cuML GPU ICA when available (10-50x faster than sklearn on GPU),
+    falls back to sklearn FastICA on CPU.
 
     Args:
         signal: (num_samples, num_channels) array.
@@ -89,6 +94,20 @@ def apply_ica(signal, n_components=None):
         n_components = signal.shape[1]
     if np.std(signal) < 1e-8:
         return signal
+
+    if HAS_CUML:
+        import cupy as cp
+        sig_gpu = cp.asarray(signal, dtype=cp.float32)
+        ica = CuMLFastICA(n_components=n_components, max_iter=200, tol=1e-3,
+                          random_state=config.RANDOM_SEED)
+        sources = ica.fit_transform(sig_gpu)
+        sources = cp.asnumpy(sources)
+        variances = np.var(sources, axis=0)
+        sources[:, np.argmax(variances)] = 0
+        mixing = cp.asnumpy(ica.mixing_)
+        return sources @ mixing.T + np.mean(signal, axis=0)
+
+    # Fallback: sklearn CPU
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', category=UserWarning,
                                 message='.*FastICA did not converge.*')
@@ -179,10 +198,44 @@ def segment_signal(signal, fs, segment_sec=None):
     return trimmed.reshape(n_segments, segment_samples, -1)
 
 
+# ── Cache helpers ────────────────────────────────────────────────────────────
+
+def _save_cache(dataset, path=CACHE_PATH):
+    """Save preprocessed dataset to a .npz file."""
+    save_dict = {}
+    for i, subj in enumerate(dataset):
+        for key, arr in subj.items():
+            save_dict[f"s{i}_{key}"] = arr
+    save_dict["__num_subjects__"] = np.array(len(dataset))
+    np.savez_compressed(path, **save_dict)
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    print(f"Cache saved: {path} ({size_mb:.0f} MB)")
+
+
+def _load_cache(path=CACHE_PATH):
+    """Load preprocessed dataset from cache."""
+    data = np.load(path)
+    n = int(data["__num_subjects__"])
+    keys = ["eeg_segments", "ecg_segments",
+            "labels_valence", "labels_arousal", "labels_dominance"]
+    dataset = []
+    for i in range(n):
+        dataset.append({k: data[f"s{i}_{k}"] for k in keys})
+    print(f"Loaded from cache: {path} ({n} subjects)")
+    return dataset
+
+
+def clear_cache(path=CACHE_PATH):
+    """Delete the preprocessed cache file."""
+    if os.path.exists(path):
+        os.remove(path)
+        print(f"Cache cleared: {path}")
+
+
 # ── Full Dataset Builder ──────────────────────────────────────────────────────
 
 def _preprocess_subject(subj, subj_idx, total):
-    """Preprocess all trials for one subject. Called in parallel by build_dataset."""
+    """Preprocess all trials for one subject."""
     eeg_segments_all, ecg_segments_all = [], []
     labels_v, labels_a, labels_d = [], [], []
 
@@ -222,31 +275,39 @@ def _preprocess_subject(subj, subj_idx, total):
     }
 
 
-def build_dataset(mat_path=None):
+def build_dataset(mat_path=None, use_cache=True):
     """
-    Full preprocessing pipeline for all subjects, run in parallel.
+    Full preprocessing pipeline for all subjects with disk caching.
 
-    For each subject and trial:
-      1. Preprocess EEG and ECG signals
-      2. Extract last 60 seconds
-      3. Segment into 1-second windows
+    On the first run, preprocesses all data and saves to
+    data/preprocessed_cache.npz. On subsequent runs, loads instantly
+    from cache (skips all filtering/ICA).
 
+    Args:
+        mat_path: Path to DREAMER.mat (default: config.DATA_PATH).
+        use_cache: If True, load from cache when available.
     Returns:
-        List of 23 dicts (one per subject), each containing:
-            'eeg_segments': (num_total_segments, 128, 14) array
-            'ecg_segments': (num_total_segments, 256, 2) array
-            'labels_valence': (num_total_segments,) array of class labels
-            'labels_arousal': (num_total_segments,) array of class labels
-            'labels_dominance': (num_total_segments,) array of class labels
+        List of 23 dicts (one per subject).
     """
+    # Try loading from cache
+    if use_cache and os.path.exists(CACHE_PATH):
+        return _load_cache(CACHE_PATH)
+
+    # No cache — preprocess from scratch
     all_subjects = load_all_subjects(mat_path)
     total = len(all_subjects)
-    print(f"Preprocessing {total} subjects...")
+    ica_backend = "cuML GPU" if HAS_CUML else "sklearn CPU"
+    print(f"Preprocessing {total} subjects (ICA: {ica_backend})...")
 
-    dataset = Parallel(n_jobs=2, prefer='threads')(
-        delayed(_preprocess_subject)(subj, i, total)
+    dataset = [
+        _preprocess_subject(subj, i, total)
         for i, subj in enumerate(all_subjects)
-    )
+    ]
+
+    # Save cache for next time
+    if use_cache:
+        _save_cache(dataset, CACHE_PATH)
+
     return dataset
 
 
