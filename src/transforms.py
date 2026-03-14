@@ -9,7 +9,7 @@ Uses CuPy for GPU acceleration when available, falls back to NumPy.
 import numpy as np
 
 from src import config
-from src.utils import get_xp, to_numpy
+from src.utils import get_xp, to_numpy, HAS_CUPY
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -25,13 +25,26 @@ def _normalize_minmax(x, xp):
 
 
 def _resize_signal(signal, target_len, xp):
-    """Downsample/upsample signal to target_len using linear interpolation."""
+    """Resize a 1D signal to target_len via linear interpolation."""
     original_len = len(signal)
     if original_len == target_len:
         return signal
     x_original = xp.linspace(0, 1, original_len)
     x_target = xp.linspace(0, 1, target_len)
     return xp.interp(x_target, x_original, signal)
+
+
+def _batch_resize(signals, image_size, xp):
+    """Resize (N, src_len) -> (N, image_size) with a single vectorized op (no Python loop)."""
+    N, src_len = signals.shape
+    if src_len == image_size:
+        return signals
+    # Map each target index to a float position in the source
+    idx_float = xp.linspace(0, src_len - 1, image_size)
+    idx_lo = xp.clip(xp.floor(idx_float).astype(xp.int32), 0, src_len - 2)
+    idx_hi = idx_lo + 1
+    frac = (idx_float - idx_lo)[None, :]  # (1, image_size) for broadcasting
+    return signals[:, idx_lo] + frac * (signals[:, idx_hi] - signals[:, idx_lo])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -78,7 +91,6 @@ def recurrence_plot(signal_1d, image_size=None, threshold=None, xp=None):
     if image_size is None:
         image_size = config.ECG_IMAGE_SIZE
     x = _resize_signal(signal_1d, image_size, xp)
-    # Vectorized pairwise absolute difference
     dist_matrix = xp.abs(x[:, None] - x[None, :])
     max_dist = dist_matrix.max()
     if float(max_dist) > 1e-8:
@@ -115,11 +127,10 @@ def markov_transition_field(signal_1d, image_size=None, n_bins=8, xp=None):
     bins = xp.linspace(x_min, x_max, n_bins + 1)
     binned = xp.clip(xp.digitize(x, bins) - 1, 0, n_bins - 1)
 
-    # Transition matrix
     transition_matrix = xp.zeros((n_bins, n_bins), dtype=xp.float32)
     from_bins = binned[:-1]
     to_bins = binned[1:]
-    if xp.__name__ == 'cupy':
+    if HAS_CUPY:
         xp.add.at(transition_matrix, (from_bins, to_bins), 1)
     else:
         np.add.at(transition_matrix, (from_bins.astype(int), to_bins.astype(int)), 1)
@@ -127,7 +138,6 @@ def markov_transition_field(signal_1d, image_size=None, n_bins=8, xp=None):
     row_sums = xp.where(row_sums == 0, 1, row_sums)
     transition_matrix = transition_matrix / row_sums
 
-    # Vectorized MTF: index with outer product of binned indices
     mtf = transition_matrix[binned[:, None], binned[None, :]]
     return mtf
 
@@ -181,10 +191,8 @@ def eeg_to_2d_grid(eeg_segment, grid_size=None):
         grid_size = config.EEG_GRID_SIZE
     n_timesteps = eeg_segment.shape[0]
     grid = np.zeros((n_timesteps, grid_size, grid_size), dtype=np.float32)
-
     for ch_idx, (row, col) in config.EEG_GRID_MAP.items():
         grid[:, row, col] = eeg_segment[:, ch_idx]
-
     return grid
 
 
@@ -194,65 +202,54 @@ def eeg_to_2d_grid(eeg_segment, grid_size=None):
 
 def _batch_gaf(signals, image_size, xp):
     """Batched GAF: (N, signal_len) -> (N, image_size, image_size)."""
-    # Resize all signals
-    N = signals.shape[0]
-    x_orig = xp.linspace(0, 1, signals.shape[1])
-    x_tgt = xp.linspace(0, 1, image_size)
-    resized = xp.array([xp.interp(x_tgt, x_orig, signals[i]) for i in range(N)])
-    # Normalize each to [-1, 1]
+    resized = _batch_resize(signals, image_size, xp)
     mins = resized.min(axis=1, keepdims=True)
     maxs = resized.max(axis=1, keepdims=True)
-    rng = maxs - mins
-    rng = xp.where(rng < 1e-8, 1.0, rng)
-    normed = 2 * (resized - mins) / rng - 1
-    normed = xp.clip(normed, -1, 1)
+    rng = xp.where(maxs - mins < 1e-8, 1.0, maxs - mins)
+    normed = xp.clip(2 * (resized - mins) / rng - 1, -1, 1)
     phi = xp.arccos(normed)  # (N, image_size)
-    # Batched outer sum: (N, image_size, 1) + (N, 1, image_size)
-    gasf = xp.cos(phi[:, :, None] + phi[:, None, :])
-    return gasf
+    return xp.cos(phi[:, :, None] + phi[:, None, :])
 
 
 def _batch_rp(signals, image_size, threshold, xp):
     """Batched RP: (N, signal_len) -> (N, image_size, image_size)."""
-    N = signals.shape[0]
-    x_orig = xp.linspace(0, 1, signals.shape[1])
-    x_tgt = xp.linspace(0, 1, image_size)
-    resized = xp.array([xp.interp(x_tgt, x_orig, signals[i]) for i in range(N)])
-    # Batched pairwise distance: |x_i - x_j|
+    resized = _batch_resize(signals, image_size, xp)
+    N = resized.shape[0]
     dist = xp.abs(resized[:, :, None] - resized[:, None, :])  # (N, S, S)
-    max_dist = dist.reshape(N, -1).max(axis=1)[:, None, None]
-    max_dist = xp.where(max_dist < 1e-8, 1.0, max_dist)
-    dist = dist / max_dist
-    rp = (dist < threshold).astype(xp.float32)
-    return rp
+    max_dist = xp.where(
+        dist.reshape(N, -1).max(axis=1)[:, None, None] < 1e-8,
+        1.0,
+        dist.reshape(N, -1).max(axis=1)[:, None, None],
+    )
+    return (dist / max_dist < threshold).astype(xp.float32)
 
 
 def _batch_mtf(signals, image_size, n_bins, xp):
     """Batched MTF: (N, signal_len) -> (N, image_size, image_size)."""
-    N = signals.shape[0]
-    x_orig = xp.linspace(0, 1, signals.shape[1])
-    x_tgt = xp.linspace(0, 1, image_size)
-    resized = xp.array([xp.interp(x_tgt, x_orig, signals[i]) for i in range(N)])
+    resized = _batch_resize(signals, image_size, xp)
+    N = resized.shape[0]
+
+    # Transfer all per-sample min/max in one batch to avoid N separate GPU syncs
+    x_mins = to_numpy(resized.min(axis=1))  # single transfer: (N,)
+    x_maxs = to_numpy(resized.max(axis=1))  # single transfer: (N,)
 
     results = xp.zeros((N, image_size, image_size), dtype=xp.float32)
     for i in range(N):
-        x = resized[i]
-        x_min, x_max = float(x.min()), float(x.max())
+        x_min, x_max = float(x_mins[i]), float(x_maxs[i])
         if x_max - x_min < 1e-8:
             continue
+        x = resized[i]
         bins = xp.linspace(x_min, x_max, n_bins + 1)
         binned = xp.clip(xp.digitize(x, bins) - 1, 0, n_bins - 1)
-
         tm = xp.zeros((n_bins, n_bins), dtype=xp.float32)
         fb, tb = binned[:-1], binned[1:]
-        if xp.__name__ == 'cupy':
+        if HAS_CUPY:
             xp.add.at(tm, (fb, tb), 1)
         else:
             np.add.at(tm, (fb.astype(int), tb.astype(int)), 1)
-        row_sums = tm.sum(axis=1, keepdims=True)
-        row_sums = xp.where(row_sums == 0, 1, row_sums)
-        tm = tm / row_sums
-        results[i] = tm[binned[:, None], binned[None, :]]
+        row_sums = xp.where(tm.sum(axis=1, keepdims=True) == 0, 1,
+                            tm.sum(axis=1, keepdims=True))
+        results[i] = (tm / row_sums)[binned[:, None], binned[None, :]]
     return results
 
 
@@ -270,19 +267,15 @@ def transform_ecg_batch(ecg_segments, image_size=None):
         image_size = config.ECG_IMAGE_SIZE
     xp = get_xp()
     segs = xp.asarray(ecg_segments)
-    N = segs.shape[0]
 
     all_channels = []
     for ch in range(segs.shape[2]):
         ch_data = segs[:, :, ch]  # (N, 256)
-        gaf = _batch_gaf(ch_data, image_size, xp)
-        rp = _batch_rp(ch_data, image_size, 0.1, xp)
-        mtf = _batch_mtf(ch_data, image_size, 8, xp)
-        all_channels.extend([gaf, rp, mtf])
+        all_channels.append(_batch_gaf(ch_data, image_size, xp))
+        all_channels.append(_batch_rp(ch_data, image_size, 0.1, xp))
+        all_channels.append(_batch_mtf(ch_data, image_size, 8, xp))
 
-    # Stack: list of 6x (N, S, S) -> (N, S, S, 6)
-    result = xp.stack(all_channels, axis=-1)
-    return to_numpy(result).astype(np.float32)
+    return to_numpy(xp.stack(all_channels, axis=-1)).astype(np.float32)
 
 
 def transform_eeg_batch(eeg_segments, grid_size=None):
@@ -300,18 +293,14 @@ def transform_eeg_batch(eeg_segments, grid_size=None):
     segs = np.asarray(eeg_segments)
     N, T, _ = segs.shape
     grid = np.zeros((N, T, grid_size, grid_size), dtype=np.float32)
-
     for ch_idx, (row, col) in config.EEG_GRID_MAP.items():
         grid[:, :, row, col] = segs[:, :, ch_idx]
-
     return grid
 
 
 if __name__ == "__main__":
-    from src.utils import HAS_CUPY
     print(f"CuPy available: {HAS_CUPY}")
 
-    # Quick test with synthetic data
     print("Testing ECG 2D transforms...")
     ecg_seg = np.random.randn(256, 2)
     ecg_2d = ecg_to_2d(ecg_seg)

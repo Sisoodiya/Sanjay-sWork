@@ -3,6 +3,7 @@ Phase 1: Signal preprocessing — filtering, ICA artifact removal,
 last-60s extraction, and 1-second segmentation.
 
 Uses CuPy for GPU-accelerated filtering when available.
+Subjects are preprocessed in parallel via joblib.
 """
 
 import warnings
@@ -10,27 +11,26 @@ import warnings
 import numpy as np
 from scipy.signal import iirnotch, butter, filtfilt
 from sklearn.decomposition import FastICA
+from joblib import Parallel, delayed
 
 from src import config
 from src.data_loader import load_all_subjects, get_labels
-from src.utils import get_xp, to_numpy
+from src.utils import to_numpy
 
-# Try to import CuPy's filtfilt for GPU filtering
+# ── GPU filtfilt decision resolved once at import time ───────────────────────
 try:
     from cupyx.scipy.signal import filtfilt as cu_filtfilt
-    _HAS_CU_FILTFILT = True
+    _USE_GPU_FILTFILT = True
 except ImportError:
-    _HAS_CU_FILTFILT = False
+    cu_filtfilt = None
+    _USE_GPU_FILTFILT = False
 
 
 def _gpu_filtfilt(b, a, signal):
-    """Run filtfilt on GPU if cupy is available, else CPU."""
-    xp = get_xp()
-    if _HAS_CU_FILTFILT and xp.__name__ == 'cupy':
-        sig_gpu = xp.asarray(signal)
-        b_gpu = xp.asarray(b)
-        a_gpu = xp.asarray(a)
-        result = cu_filtfilt(b_gpu, a_gpu, sig_gpu, axis=0)
+    """Run filtfilt on GPU if CuPy is available, else CPU."""
+    if _USE_GPU_FILTFILT:
+        import cupy as cp
+        result = cu_filtfilt(cp.asarray(b), cp.asarray(a), cp.asarray(signal), axis=0)
         return to_numpy(result)
     return filtfilt(b, a, signal, axis=0)
 
@@ -74,8 +74,10 @@ def bandpass_filter(signal, fs, low=0.5, high=45.0, order=4):
 def apply_ica(signal, n_components=None):
     """
     Apply ICA for artifact removal (eye blinks, muscle activity).
-    Uses deflation algorithm (converges better on EEG). Partial convergence
-    is acceptable — the dominant artifact component is still identified.
+
+    Uses the parallel algorithm (3-5x faster than deflation).
+    Partial convergence is acceptable — the dominant artifact component
+    is still identified.
 
     Args:
         signal: (num_samples, num_channels) array.
@@ -85,14 +87,13 @@ def apply_ica(signal, n_components=None):
     """
     if n_components is None:
         n_components = signal.shape[1]
-    # Skip ICA if signal has near-zero variance (e.g., flat/constant signal)
     if np.std(signal) < 1e-8:
         return signal
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', category=UserWarning,
                                 message='.*FastICA did not converge.*')
-        ica = FastICA(n_components=n_components, algorithm='deflation',
-                      max_iter=2000, tol=1e-3,
+        ica = FastICA(n_components=n_components, algorithm='parallel',
+                      max_iter=200, tol=1e-3,
                       random_state=config.RANDOM_SEED)
         sources = ica.fit_transform(signal)
     variances = np.var(sources, axis=0)
@@ -174,17 +175,56 @@ def segment_signal(signal, fs, segment_sec=None):
         segment_sec = config.SEGMENT_LENGTH_SEC
     segment_samples = int(segment_sec * fs)
     n_segments = signal.shape[0] // segment_samples
-    # Trim any trailing samples that don't fill a complete segment
     trimmed = signal[: n_segments * segment_samples]
-    segments = trimmed.reshape(n_segments, segment_samples, -1)
-    return segments
+    return trimmed.reshape(n_segments, segment_samples, -1)
 
 
 # ── Full Dataset Builder ──────────────────────────────────────────────────────
 
+def _preprocess_subject(subj, subj_idx, total):
+    """Preprocess all trials for one subject. Called in parallel by build_dataset."""
+    eeg_segments_all, ecg_segments_all = [], []
+    labels_v, labels_a, labels_d = [], [], []
+
+    v_scores = get_labels(subj["valence"])
+    a_scores = get_labels(subj["arousal"])
+    d_scores = get_labels(subj["dominance"])
+
+    for trial_idx in range(config.NUM_TRIALS):
+        eeg = preprocess_eeg(subj["eeg_stimuli"][trial_idx])
+        ecg = preprocess_ecg(subj["ecg_stimuli"][trial_idx])
+
+        eeg = extract_last_n_seconds(eeg, config.EEG_SR)
+        ecg = extract_last_n_seconds(ecg, config.ECG_SR)
+
+        eeg_segs = segment_signal(eeg, config.EEG_SR)   # (N, 128, 14)
+        ecg_segs = segment_signal(ecg, config.ECG_SR)   # (N, 256, 2)
+
+        n_segs = min(len(eeg_segs), len(ecg_segs))
+        eeg_segments_all.append(eeg_segs[:n_segs])
+        ecg_segments_all.append(ecg_segs[:n_segs])
+
+        labels_v.extend([v_scores[trial_idx]] * n_segs)
+        labels_a.extend([a_scores[trial_idx]] * n_segs)
+        labels_d.extend([d_scores[trial_idx]] * n_segs)
+
+    eeg_arr = np.concatenate(eeg_segments_all, axis=0)
+    ecg_arr = np.concatenate(ecg_segments_all, axis=0)
+    print(f"  Subject {subj_idx + 1}/{total}: "
+          f"EEG {eeg_arr.shape}, ECG {ecg_arr.shape}, "
+          f"Labels {len(labels_v)}")
+    return {
+        "eeg_segments": eeg_arr,
+        "ecg_segments": ecg_arr,
+        "labels_valence": np.array(labels_v),
+        "labels_arousal": np.array(labels_a),
+        "labels_dominance": np.array(labels_d),
+    }
+
+
 def build_dataset(mat_path=None):
     """
-    Full preprocessing pipeline for all subjects.
+    Full preprocessing pipeline for all subjects, run in parallel.
 
     For each subject and trial:
       1. Preprocess EEG and ECG signals
@@ -200,59 +240,13 @@ def build_dataset(mat_path=None):
             'labels_dominance': (num_total_segments,) array of class labels
     """
     all_subjects = load_all_subjects(mat_path)
-    dataset = []
+    total = len(all_subjects)
+    print(f"Preprocessing {total} subjects in parallel...")
 
-    for subj_idx, subj in enumerate(all_subjects):
-        print(f"Preprocessing subject {subj_idx + 1}/{config.NUM_SUBJECTS}...")
-
-        eeg_segments_all = []
-        ecg_segments_all = []
-        labels_v, labels_a, labels_d = [], [], []
-
-        v_scores = get_labels(subj["valence"])
-        a_scores = get_labels(subj["arousal"])
-        d_scores = get_labels(subj["dominance"])
-
-        for trial_idx in range(config.NUM_TRIALS):
-            # Preprocess
-            eeg = preprocess_eeg(subj["eeg_stimuli"][trial_idx])
-            ecg = preprocess_ecg(subj["ecg_stimuli"][trial_idx])
-
-            # Extract last 60 seconds
-            eeg = extract_last_n_seconds(eeg, config.EEG_SR)
-            ecg = extract_last_n_seconds(ecg, config.ECG_SR)
-
-            # Segment into 1s windows
-            eeg_segs = segment_signal(eeg, config.EEG_SR)  # (N, 128, 14)
-            ecg_segs = segment_signal(ecg, config.ECG_SR)   # (N, 256, 2)
-
-            # Ensure same number of segments from both modalities
-            n_segs = min(len(eeg_segs), len(ecg_segs))
-            eeg_segs = eeg_segs[:n_segs]
-            ecg_segs = ecg_segs[:n_segs]
-
-            eeg_segments_all.append(eeg_segs)
-            ecg_segments_all.append(ecg_segs)
-
-            # Each segment in this trial gets the same label
-            labels_v.extend([v_scores[trial_idx]] * n_segs)
-            labels_a.extend([a_scores[trial_idx]] * n_segs)
-            labels_d.extend([d_scores[trial_idx]] * n_segs)
-
-        dataset.append({
-            "eeg_segments": np.concatenate(eeg_segments_all, axis=0),
-            "ecg_segments": np.concatenate(ecg_segments_all, axis=0),
-            "labels_valence": np.array(labels_v),
-            "labels_arousal": np.array(labels_a),
-            "labels_dominance": np.array(labels_d),
-        })
-        print(
-            f"  Subject {subj_idx}: "
-            f"EEG {dataset[-1]['eeg_segments'].shape}, "
-            f"ECG {dataset[-1]['ecg_segments'].shape}, "
-            f"Labels {len(labels_v)}"
-        )
-
+    dataset = Parallel(n_jobs=-1, prefer='threads')(
+        delayed(_preprocess_subject)(subj, i, total)
+        for i, subj in enumerate(all_subjects)
+    )
     return dataset
 
 
