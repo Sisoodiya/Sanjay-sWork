@@ -82,3 +82,27 @@ EARLY_STOPPING_PATIENCE = 10
 REDUCE_LR_PATIENCE = 5
 REDUCE_LR_FACTOR = 0.5
 RANDOM_SEED = 42
+
+# ── Data Augmentation ────────────────────────────────────────────────────────
+AUG_RATIO = 0.5             # Augment 50% extra copies of training data
+AUG_TIME_SHIFT_MAX = 10     # Max circular shift in time steps (EEG only)
+AUG_NOISE_STD = 0.01        # Gaussian noise standard deviation
+AUG_CHANNEL_DROP_PROB = 0.1 # Per-channel dropout probability (EEG only)
+AUG_AMPLITUDE_RANGE = (0.9, 1.1)  # Random amplitude scaling range
+
+# ── ICA Artifact Detection ───────────────────────────────────────────────────
+ICA_KURTOSIS_THRESHOLD = 5.0   # |kurtosis| above this flags a component
+ICA_VARIANCE_RATIO = 3.0       # Variance-to-median ratio threshold
+
+# ── Learning Rate Schedule ───────────────────────────────────────────────────
+LR_WARMUP_EPOCHS = 5           # Linear warmup epochs
+LR_USE_COSINE_DECAY = True     # Use cosine decay after warmup (else plateau)
+
+# ── Regularization ───────────────────────────────────────────────────────────
+L2_WEIGHT_DECAY = 1e-4         # L2 kernel regularization weight
+LABEL_SMOOTHING = 0.1          # Label smoothing factor (0 = off)
+
+# ── Focal Loss ───────────────────────────────────────────────────────────────
+USE_FOCAL_LOSS = True          # Use focal loss instead of crossentropy
+FOCAL_LOSS_GAMMA = 2.0         # Focusing parameter (higher = more focus on hard)
+FOCAL_LOSS_ALPHA = None        # Per-class weights (None = auto from class freq)

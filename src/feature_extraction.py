@@ -58,15 +58,50 @@ class TransformerEncoderBlock(layers.Layer):
         return base
 
 
+class SpatialAttentionPooling(layers.Layer):
+    """
+    Learnable attention-weighted pooling over spatial tokens.
+
+    Instead of mean-pooling (which equally weights all 81 grid positions
+    including the ~67 zero-padded ones), this learns to weight the 14
+    electrode positions differently.
+
+    Input:  (batch, timesteps, num_spatial_tokens, d_model)
+    Output: (batch, timesteps, d_model)
+    """
+
+    def __init__(self, d_model=None, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model or config.D_MODEL
+
+    def build(self, input_shape):
+        self.attn_dense = layers.Dense(1, use_bias=True, name="spatial_attn_score")
+        super().build(input_shape)
+
+    def call(self, x):
+        # x: (batch, timesteps, num_tokens, d_model)
+        scores = self.attn_dense(x)  # (batch, timesteps, num_tokens, 1)
+        weights = tf.nn.softmax(scores, axis=2)  # Softmax over spatial dim
+        pooled = tf.reduce_sum(x * weights, axis=2)  # (batch, timesteps, d_model)
+        return pooled
+
+    def get_config(self):
+        base = super().get_config()
+        base.update({"d_model": self.d_model})
+        return base
+
+
 class EEGTransformerEncoder(layers.Layer):
     """
-    EEG feature extractor:
-      (batch, 128, 9, 9) → SpatialPositionEncoding → collapse time×space →
-      TransformerEncoder stack → (batch, seq, d_model)
+    EEG feature extractor with deferred spatial pooling:
+      (batch, 128, 9, 9) → SpatialPositionEncoding → (batch, 128, 81, d_model)
+      → Per-timestep Transformer over spatial tokens →
+      → Learnable spatial attention pooling → (batch, 128, d_model)
+      → Temporal positional encoding → Transformer stack → (batch, 128, d_model)
 
-    The 128 timesteps × 81 spatial tokens are combined: for each timestep,
-    the 81 spatial tokens are averaged (pooled), producing a 128-length
-    temporal sequence, which is then processed by the Transformer.
+    Key improvement: spatial tokens are processed by a Transformer BEFORE
+    being pooled. This lets the model learn spatial relationships between
+    electrode positions before compressing to a per-timestep representation.
     """
 
     def __init__(self, d_model=None, num_heads=None, ff_dim=None,
@@ -82,9 +117,20 @@ class EEGTransformerEncoder(layers.Layer):
         self.spatial_encoding = SpatialPositionEncoding(
             d_model=self.d_model, name="eeg_spatial_enc"
         )
+        # Spatial Transformer: processes 81 spatial tokens per timestep
+        self.spatial_transformer = TransformerEncoderBlock(
+            d_model=self.d_model, num_heads=self.num_heads,
+            ff_dim=self.ff_dim, dropout=self.dropout_rate,
+            name="eeg_spatial_transformer"
+        )
+        # Learnable spatial attention pooling (replaces mean pooling)
+        self.spatial_pool = SpatialAttentionPooling(
+            d_model=self.d_model, name="eeg_spatial_pool"
+        )
         self.temporal_pos = TemporalPositionEncoding(
             max_len=256, d_model=self.d_model, name="eeg_temporal_pos"
         )
+        # Temporal Transformer stack
         self.transformer_blocks = [
             TransformerEncoderBlock(
                 d_model=self.d_model, num_heads=self.num_heads,
@@ -102,13 +148,26 @@ class EEGTransformerEncoder(layers.Layer):
         Returns:
             (batch, 128, d_model)
         """
+        batch_size = tf.shape(x)[0]
+        timesteps = tf.shape(x)[1]
+
         # Spatial encoding: (batch, 128, 81, d_model)
         x = self.spatial_encoding(x)
-        # Pool over spatial tokens: (batch, 128, d_model)
-        x = tf.reduce_mean(x, axis=2)
+
+        # Process spatial tokens with Transformer (per timestep):
+        # Reshape to (batch * timesteps, 81, d_model) for efficient batching
+        num_tokens = x.shape[2] or tf.shape(x)[2]  # 81
+        x = tf.reshape(x, [batch_size * timesteps, num_tokens, self.d_model])
+        x = self.spatial_transformer(x, training=training)
+        # Reshape back: (batch, timesteps, 81, d_model)
+        x = tf.reshape(x, [batch_size, timesteps, num_tokens, self.d_model])
+
+        # Learnable attention pooling over spatial tokens: (batch, 128, d_model)
+        x = self.spatial_pool(x)
+
         # Add temporal positional encoding
         x = self.temporal_pos(x)
-        # Transformer blocks
+        # Temporal Transformer blocks
         for block in self.transformer_blocks:
             x = block(x, training=training)
         return x

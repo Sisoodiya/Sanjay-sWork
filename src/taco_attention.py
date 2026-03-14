@@ -7,7 +7,7 @@ Performs simultaneous:
 """
 
 import tensorflow as tf
-from tensorflow.keras import layers
+from tensorflow.keras import layers, regularizers
 
 from src import config
 
@@ -133,11 +133,15 @@ class TACOCrossAttention(layers.Layer):
         self.cca_ecg2eeg = ChannelCrossAttention(
             self.d_model, self.num_heads, self.dropout_rate, name="cca_ecg2eeg"
         )
-        # Projection layers to combine cross-attention outputs
-        self.proj_eeg = layers.Dense(self.d_model, activation="relu", name="proj_eeg")
-        self.proj_ecg = layers.Dense(self.d_model, activation="relu", name="proj_ecg")
+        # Projection layers to combine cross-attention outputs (with L2)
+        l2_reg = regularizers.l2(config.L2_WEIGHT_DECAY)
+        self.proj_eeg = layers.Dense(self.d_model, activation="relu",
+                                     kernel_regularizer=l2_reg, name="proj_eeg")
+        self.proj_ecg = layers.Dense(self.d_model, activation="relu",
+                                     kernel_regularizer=l2_reg, name="proj_ecg")
         self.final_norm = layers.LayerNormalization(epsilon=1e-6, name="taco_final_norm")
-        self.final_proj = layers.Dense(self.d_model, name="taco_final_proj")
+        self.final_proj = layers.Dense(self.d_model, kernel_regularizer=l2_reg,
+                                       name="taco_final_proj")
         super().build(input_shape)
 
     def call(self, eeg_features, ecg_features, training=False):

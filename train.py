@@ -17,6 +17,7 @@ from src import config
 from src.utils import set_seed, get_class_weights, ensure_dir
 from src.preprocessing import build_dataset
 from src.transforms import transform_ecg_batch, transform_eeg_batch
+from src.augmentation import augment_training_data
 from src.model import build_model
 from src.evaluate import (
     compute_metrics, print_classification_report,
@@ -26,20 +27,31 @@ from src.evaluate import (
 
 def prepare_fold_data(dataset, test_subject_idx, target):
     """
-    Split dataset into train and test for one LOSOCV fold.
+    Split dataset into train, validation, and test for one LOSOCV fold.
+
+    Uses a separate training subject as validation to avoid data leakage.
+    The validation subject is chosen as the one immediately before the test
+    subject (wrapping around), ensuring the test subject is never used for
+    EarlyStopping or ReduceLROnPlateau decisions.
 
     Args:
         dataset: List of 23 subject dicts from build_dataset().
-        test_subject_idx: Index of the held-out subject.
+        test_subject_idx: Index of the held-out test subject.
         target: 'valence', 'arousal', or 'dominance'.
     Returns:
-        (train_eeg, train_ecg, train_labels, test_eeg, test_ecg, test_labels)
+        (train_eeg, train_ecg, train_labels,
+         val_eeg, val_ecg, val_labels,
+         test_eeg, test_ecg, test_labels)
     """
     label_key = f"labels_{target}"
+    n_subjects = len(dataset)
+
+    # Pick a validation subject: the one before the test subject (wrapping)
+    val_subject_idx = (test_subject_idx - 1) % n_subjects
 
     train_eeg, train_ecg, train_labels = [], [], []
     for i, subj in enumerate(dataset):
-        if i == test_subject_idx:
+        if i == test_subject_idx or i == val_subject_idx:
             continue
         train_eeg.append(subj["eeg_segments"])
         train_ecg.append(subj["ecg_segments"])
@@ -49,11 +61,17 @@ def prepare_fold_data(dataset, test_subject_idx, target):
     train_ecg = np.concatenate(train_ecg, axis=0)
     train_labels = np.concatenate(train_labels, axis=0)
 
+    val_eeg = dataset[val_subject_idx]["eeg_segments"]
+    val_ecg = dataset[val_subject_idx]["ecg_segments"]
+    val_labels = dataset[val_subject_idx][label_key]
+
     test_eeg = dataset[test_subject_idx]["eeg_segments"]
     test_ecg = dataset[test_subject_idx]["ecg_segments"]
     test_labels = dataset[test_subject_idx][label_key]
 
-    return train_eeg, train_ecg, train_labels, test_eeg, test_ecg, test_labels
+    return (train_eeg, train_ecg, train_labels,
+            val_eeg, val_ecg, val_labels,
+            test_eeg, test_ecg, test_labels)
 
 
 def apply_transforms(eeg_segments, ecg_segments):
@@ -92,51 +110,80 @@ def losocv_train(dataset, target="valence", num_subjects=None, save_dir=None):
         print(f"LOSOCV Fold {fold + 1}/{num_subjects} — Test Subject: {fold}")
         print(f"{'=' * 60}")
 
-        # Split data
-        train_eeg, train_ecg, train_labels, test_eeg, test_ecg, test_labels = \
-            prepare_fold_data(dataset, fold, target)
+        # Split data (train / validation / test)
+        (train_eeg, train_ecg, train_labels,
+         val_eeg, val_ecg, val_labels,
+         test_eeg, test_ecg, test_labels) = prepare_fold_data(dataset, fold, target)
 
-        print(f"  Train: {len(train_labels)} segments, Test: {len(test_labels)} segments")
+        val_subject_idx = (fold - 1) % len(dataset)
+        print(f"  Train: {len(train_labels)} segments (21 subjects), "
+              f"Val: {len(val_labels)} segments (subject {val_subject_idx}), "
+              f"Test: {len(test_labels)} segments (subject {fold})")
 
         # Apply 2D transforms
         print("  Transforming training data...")
         train_eeg_2d, train_ecg_2d = apply_transforms(train_eeg, train_ecg)
+        print("  Transforming validation data...")
+        val_eeg_2d, val_ecg_2d = apply_transforms(val_eeg, val_ecg)
         print("  Transforming test data...")
         test_eeg_2d, test_ecg_2d = apply_transforms(test_eeg, test_ecg)
 
         # One-hot encode labels
         train_labels_oh = to_categorical(train_labels, config.NUM_CLASSES)
+        val_labels_oh = to_categorical(val_labels, config.NUM_CLASSES)
+
+        # Data augmentation (training data only)
+        n_before = len(train_labels_oh)
+        train_eeg_2d, train_ecg_2d, train_labels_oh = augment_training_data(
+            train_eeg_2d, train_ecg_2d, train_labels_oh,
+        )
+        print(f"  Augmentation: {n_before} → {len(train_labels_oh)} training segments")
         test_labels_oh = to_categorical(test_labels, config.NUM_CLASSES)
 
         # Class weights
         class_weights = get_class_weights(train_labels)
         print(f"  Class weights: {class_weights}")
 
-        # Build model (fresh for each fold)
-        model = build_model()
+        # Build LR schedule (warmup + cosine decay)
+        steps_per_epoch = len(train_labels_oh) // config.BATCH_SIZE + 1
+        if config.LR_USE_COSINE_DECAY:
+            from src.lr_schedule import build_lr_schedule
+            lr_schedule = build_lr_schedule(steps_per_epoch)
+            print(f"  LR schedule: warmup {config.LR_WARMUP_EPOCHS} epochs → cosine decay")
+        else:
+            lr_schedule = None
 
-        # Callbacks
+        # Build model (fresh for each fold; passes class weights for focal loss)
+        model = build_model(lr_schedule=lr_schedule, class_weights=class_weights)
+
+        # Callbacks (monitor validation loss — from a separate subject, not test)
         callbacks = [
             tf.keras.callbacks.EarlyStopping(
                 monitor="val_loss",
                 patience=config.EARLY_STOPPING_PATIENCE,
                 restore_best_weights=True,
             ),
-            tf.keras.callbacks.ReduceLROnPlateau(
+        ]
+        # Only add ReduceLROnPlateau when NOT using cosine decay schedule
+        if not config.LR_USE_COSINE_DECAY:
+            callbacks.append(tf.keras.callbacks.ReduceLROnPlateau(
                 monitor="val_loss",
                 factor=config.REDUCE_LR_FACTOR,
                 patience=config.REDUCE_LR_PATIENCE,
-            ),
-        ]
+            ))
 
-        # Train
+        # When using focal loss, class weights are handled by the loss's alpha
+        # parameter — do NOT also pass class_weight to model.fit (double-counting)
+        fit_class_weight = None if config.USE_FOCAL_LOSS else class_weights
+
+        # Train (validation data is a separate subject, NOT the test subject)
         model.fit(
             [train_eeg_2d, train_ecg_2d],
             train_labels_oh,
-            validation_data=([test_eeg_2d, test_ecg_2d], test_labels_oh),
+            validation_data=([val_eeg_2d, val_ecg_2d], val_labels_oh),
             batch_size=config.BATCH_SIZE,
             epochs=config.EPOCHS,
-            class_weight=class_weights,
+            class_weight=fit_class_weight,
             callbacks=callbacks,
             verbose=1,
         )

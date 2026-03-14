@@ -225,31 +225,57 @@ def _batch_rp(signals, image_size, threshold, xp):
 
 
 def _batch_mtf(signals, image_size, n_bins, xp):
-    """Batched MTF: (N, signal_len) -> (N, image_size, image_size)."""
+    """Batched MTF: (N, signal_len) -> (N, image_size, image_size).
+
+    Fully vectorized — no Python loop over samples.
+    """
     resized = _batch_resize(signals, image_size, xp)
-    N = resized.shape[0]
+    N, S = resized.shape
 
-    # Transfer all per-sample min/max in one batch to avoid N separate GPU syncs
-    x_mins = to_numpy(resized.min(axis=1))  # single transfer: (N,)
-    x_maxs = to_numpy(resized.max(axis=1))  # single transfer: (N,)
+    # Per-sample min/max: (N, 1)
+    x_mins = resized.min(axis=1, keepdims=True)
+    x_maxs = resized.max(axis=1, keepdims=True)
+    rng = x_maxs - x_mins
 
-    results = xp.zeros((N, image_size, image_size), dtype=xp.float32)
-    for i in range(N):
-        x_min, x_max = float(x_mins[i]), float(x_maxs[i])
-        if x_max - x_min < 1e-8:
-            continue
-        x = resized[i]
-        bins = xp.linspace(x_min, x_max, n_bins + 1)
-        binned = xp.clip(xp.digitize(x, bins) - 1, 0, n_bins - 1)
-        tm = xp.zeros((n_bins, n_bins), dtype=xp.float32)
-        fb, tb = binned[:-1], binned[1:]
-        if HAS_CUPY:
-            xp.add.at(tm, (fb, tb), 1)
-        else:
-            np.add.at(tm, (fb.astype(int), tb.astype(int)), 1)
-        row_sums = xp.where(tm.sum(axis=1, keepdims=True) == 0, 1,
-                            tm.sum(axis=1, keepdims=True))
-        results[i] = (tm / row_sums)[binned[:, None], binned[None, :]]
+    # Mask for constant signals (range ~ 0)
+    valid = (rng.squeeze(1) > 1e-8)  # (N,)
+
+    # Normalize to [0, 1] then quantize to bin indices
+    safe_rng = xp.where(rng < 1e-8, 1.0, rng)
+    normed = (resized - x_mins) / safe_rng  # (N, S), values in [0, 1]
+    # Map to bin indices [0, n_bins-1]
+    binned = xp.clip((normed * n_bins).astype(xp.int32), 0, n_bins - 1)  # (N, S)
+
+    # Build transition matrices vectorized using one-hot scatter
+    from_bins = binned[:, :-1]  # (N, S-1)
+    to_bins = binned[:, 1:]     # (N, S-1)
+
+    # Flatten to 1D index: sample * n_bins * n_bins + from_bin * n_bins + to_bin
+    sample_idx = xp.arange(N)[:, None] * (n_bins * n_bins)  # (N, 1)
+    flat_idx = sample_idx + from_bins * n_bins + to_bins      # (N, S-1)
+    flat_idx = flat_idx.reshape(-1)
+
+    tm_flat = xp.zeros(N * n_bins * n_bins, dtype=xp.float32)
+    if HAS_CUPY:
+        xp.add.at(tm_flat, flat_idx, 1)
+    else:
+        np.add.at(tm_flat, flat_idx.astype(int), 1)
+    tm = tm_flat.reshape(N, n_bins, n_bins)  # (N, n_bins, n_bins)
+
+    # Row-normalize transition matrices
+    row_sums = tm.sum(axis=2, keepdims=True)
+    row_sums = xp.where(row_sums == 0, 1.0, row_sums)
+    tm = tm / row_sums  # (N, n_bins, n_bins)
+
+    # Build MTF images via advanced indexing: MTF[i,j] = tm[binned[i], binned[j]]
+    row_idx = binned[:, :, None].repeat(S, axis=2)   # (N, S, S)
+    col_idx = binned[:, None, :].repeat(S, axis=1)   # (N, S, S)
+    batch_idx = xp.arange(N)[:, None, None]           # (N, 1, 1)
+    results = tm[batch_idx, row_idx, col_idx]         # (N, S, S)
+
+    # Zero out results for constant-signal samples
+    results = results * valid[:, None, None].astype(xp.float32)
+
     return results
 
 

@@ -3,18 +3,22 @@ Phase 3: Full model assembly — Enhanced Att-1DCNN-GRU with TACO Cross-Attentio
 
 Combines EEG and ECG Transformer encoders with TACO fusion and a
 classification head for 3-class emotion prediction.
+
+Includes L2 regularization, focal loss, and configurable LR schedule.
 """
 
 import tensorflow as tf
-from tensorflow.keras import layers, Model
+from tensorflow.keras import layers, Model, regularizers
 
 from src import config
 from src.feature_extraction import EEGTransformerEncoder, ECGTransformerEncoder
 from src.taco_attention import TACOCrossAttention
+from src.losses import CategoricalFocalLoss
 
 
 def build_model(num_classes=None, d_model=None, num_heads=None, ff_dim=None,
-                num_layers=None, dropout=None, learning_rate=None):
+                num_layers=None, dropout=None, learning_rate=None,
+                lr_schedule=None, class_weights=None):
     """
     Build the complete multimodal emotion recognition model.
 
@@ -24,8 +28,11 @@ def build_model(num_classes=None, d_model=None, num_heads=None, ff_dim=None,
                                         ↓
                               TACOCrossAttention
                                         ↓
-                              Dense(128) → Dropout → Dense(num_classes, softmax)
+                              Dense(128, L2) → Dropout → Dense(num_classes, softmax)
 
+    Args:
+        lr_schedule: Optional TF LearningRateSchedule (overrides learning_rate).
+        class_weights: Optional dict {class_idx: weight} for focal loss alpha.
     Returns:
         Compiled Keras Model.
     """
@@ -43,6 +50,8 @@ def build_model(num_classes=None, d_model=None, num_heads=None, ff_dim=None,
         dropout = config.DROPOUT_RATE
     if learning_rate is None:
         learning_rate = config.LEARNING_RATE
+
+    l2_reg = regularizers.l2(config.L2_WEIGHT_DECAY)
 
     # ── Inputs ────────────────────────────────────────────────────────────
     eeg_input = layers.Input(
@@ -75,16 +84,37 @@ def build_model(num_classes=None, d_model=None, num_heads=None, ff_dim=None,
     )
     fused = taco(eeg_features, ecg_features)  # (batch, d_model)
 
-    # ── Classification Head ───────────────────────────────────────────────
-    x = layers.Dense(128, activation="relu", name="cls_dense1")(fused)
+    # ── Classification Head (with L2 regularization) ─────────────────────
+    x = layers.Dense(128, activation="relu", kernel_regularizer=l2_reg,
+                     name="cls_dense1")(fused)
     x = layers.Dropout(dropout, name="cls_dropout")(x)
-    output = layers.Dense(num_classes, activation="softmax", name="cls_output")(x)
+    output = layers.Dense(num_classes, activation="softmax",
+                          kernel_regularizer=l2_reg, name="cls_output")(x)
+
+    # ── Loss ──────────────────────────────────────────────────────────────
+    if config.USE_FOCAL_LOSS:
+        loss_fn = CategoricalFocalLoss(
+            gamma=config.FOCAL_LOSS_GAMMA,
+            label_smoothing=config.LABEL_SMOOTHING,
+        )
+        if class_weights is not None:
+            loss_fn.set_alpha_from_weights(class_weights)
+    elif config.LABEL_SMOOTHING > 0:
+        loss_fn = tf.keras.losses.CategoricalCrossentropy(
+            label_smoothing=config.LABEL_SMOOTHING,
+        )
+    else:
+        loss_fn = "categorical_crossentropy"
+
+    # ── Optimizer (with optional LR schedule) ─────────────────────────────
+    opt_lr = lr_schedule if lr_schedule is not None else learning_rate
+    optimizer = tf.keras.optimizers.Adam(learning_rate=opt_lr)
 
     # ── Compile ───────────────────────────────────────────────────────────
     model = Model(inputs=[eeg_input, ecg_input], outputs=output, name="TACO_Emotion_Model")
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-        loss="categorical_crossentropy",
+        optimizer=optimizer,
+        loss=loss_fn,
         metrics=["accuracy"],
     )
     return model

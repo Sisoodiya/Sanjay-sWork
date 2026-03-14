@@ -77,9 +77,85 @@ def bandpass_filter(signal, fs, low=0.5, high=45.0, order=4):
     return _gpu_filtfilt(b, a, signal)
 
 
+def _identify_artifact_components(sources, signal=None, kurtosis_threshold=None,
+                                   variance_ratio=None):
+    """
+    Identify ICA components likely to be artifacts using multiple heuristics.
+
+    Heuristics:
+      1. Kurtosis: Eye blinks / muscle artifacts produce super-Gaussian
+         (high-kurtosis) components. Components with |kurtosis| above the
+         threshold are flagged.
+      2. Variance outlier: Components whose variance exceeds `variance_ratio`
+         times the median variance are flagged (extreme-energy artifacts).
+      3. Frontal correlation: If the original signal is provided and has ≥14
+         channels (EEG), components highly correlated with frontal channels
+         (AF3=0, AF4=13) are likely ocular artifacts.
+
+    Args:
+        sources: (num_samples, n_components) ICA source matrix.
+        signal: Original (num_samples, num_channels) signal (optional, for
+                frontal correlation check).
+        kurtosis_threshold: |kurtosis| above this flags a component (default: 5.0).
+        variance_ratio: Variance-to-median ratio threshold (default: 3.0).
+    Returns:
+        List of component indices identified as artifacts.
+    """
+    from scipy.stats import kurtosis as sp_kurtosis
+
+    if kurtosis_threshold is None:
+        kurtosis_threshold = config.ICA_KURTOSIS_THRESHOLD
+    if variance_ratio is None:
+        variance_ratio = config.ICA_VARIANCE_RATIO
+
+    n_components = sources.shape[1]
+    artifact_flags = np.zeros(n_components, dtype=bool)
+
+    # Heuristic 1: Excess kurtosis (Fisher definition, normal = 0)
+    kurt = sp_kurtosis(sources, axis=0, fisher=True)
+    artifact_flags |= (np.abs(kurt) > kurtosis_threshold)
+
+    # Heuristic 2: Variance outlier
+    variances = np.var(sources, axis=0)
+    median_var = np.median(variances)
+    if median_var > 1e-10:
+        artifact_flags |= (variances > variance_ratio * median_var)
+
+    # Heuristic 3: High correlation with frontal EEG channels (ocular artifacts)
+    if signal is not None and signal.shape[1] >= 14:
+        frontal_channels = [0, 13]  # AF3, AF4
+        for ch_idx in frontal_channels:
+            frontal_signal = signal[:, ch_idx]
+            frontal_std = np.std(frontal_signal)
+            if frontal_std < 1e-8:
+                continue
+            for comp in range(n_components):
+                comp_std = np.std(sources[:, comp])
+                if comp_std < 1e-8:
+                    continue
+                corr = np.abs(np.corrcoef(frontal_signal, sources[:, comp])[0, 1])
+                if corr > 0.8:
+                    artifact_flags[comp] = True
+
+    artifact_indices = np.where(artifact_flags)[0].tolist()
+
+    # Safety: never remove more than half the components
+    max_remove = max(1, n_components // 2)
+    if len(artifact_indices) > max_remove:
+        # Keep only the most suspicious ones (highest kurtosis)
+        scored = sorted(artifact_indices, key=lambda c: abs(kurt[c]), reverse=True)
+        artifact_indices = scored[:max_remove]
+
+    return artifact_indices
+
+
 def apply_ica(signal, n_components=None):
     """
     Apply ICA for artifact removal (eye blinks, muscle activity).
+
+    Uses multi-heuristic artifact detection (kurtosis, variance outlier,
+    frontal correlation) instead of blindly zeroing the highest-variance
+    component: only components identified as likely artifacts are removed.
 
     Uses cuML GPU ICA when available (10-50x faster than sklearn on GPU),
     falls back to sklearn FastICA on CPU.
@@ -102,8 +178,9 @@ def apply_ica(signal, n_components=None):
                           random_state=config.RANDOM_SEED)
         sources = ica.fit_transform(sig_gpu)
         sources = cp.asnumpy(sources)
-        variances = np.var(sources, axis=0)
-        sources[:, np.argmax(variances)] = 0
+        artifact_idx = _identify_artifact_components(sources, signal)
+        if artifact_idx:
+            sources[:, artifact_idx] = 0
         mixing = cp.asnumpy(ica.mixing_)
         return sources @ mixing.T + np.mean(signal, axis=0)
 
@@ -115,8 +192,9 @@ def apply_ica(signal, n_components=None):
                       max_iter=200, tol=1e-3,
                       random_state=config.RANDOM_SEED)
         sources = ica.fit_transform(signal)
-    variances = np.var(sources, axis=0)
-    sources[:, np.argmax(variances)] = 0
+    artifact_idx = _identify_artifact_components(sources, signal)
+    if artifact_idx:
+        sources[:, artifact_idx] = 0
     return ica.inverse_transform(sources)
 
 
