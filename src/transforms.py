@@ -297,8 +297,8 @@ def transform_ecg_batch(ecg_segments, image_size=None):
     N = ecg_segments.shape[0]
     chunk_size = config.TRANSFORM_BATCH_SIZE
 
-    # Pre-allocate output array
-    result = np.empty((N, image_size, image_size, 6), dtype=np.float32)
+    # Pre-allocate output array (use float16 to save RAM)
+    result = np.empty((N, image_size, image_size, 6), dtype=np.float16)
 
     for start in range(0, N, chunk_size):
         end = min(start + chunk_size, N)
@@ -312,7 +312,7 @@ def transform_ecg_batch(ecg_segments, image_size=None):
             all_channels.append(_batch_rp(ch_data, image_size, 0.1, xp))
             all_channels.append(_batch_mtf(ch_data, image_size, 8, xp))
 
-        chunk_result = to_numpy(xp.stack(all_channels, axis=-1)).astype(np.float32)
+        chunk_result = to_numpy(xp.stack(all_channels, axis=-1)).astype(np.float16)
         result[start:end] = chunk_result
         del segs, all_channels, chunk_result  # Free chunk memory
 
@@ -332,11 +332,11 @@ def transform_eeg_batch(eeg_segments, grid_size=None):
     if grid_size is None:
         grid_size = config.EEG_GRID_SIZE
     segs = np.asarray(eeg_segments)
-    N, T, _ = segs.shape
-    grid = np.zeros((N, T, grid_size, grid_size), dtype=np.float32)
+    N, T, n_channels = segs.shape
+    result = np.zeros((N, T, grid_size, grid_size), dtype=np.float32) # Pre-allocate as float32, convert at end
     for ch_idx, (row, col) in config.EEG_GRID_MAP.items():
-        grid[:, :, row, col] = segs[:, :, ch_idx]
-    return grid
+        result[:, :, row, col] = segs[:, :, ch_idx]
+    return result.astype(np.float16)
 
 
 if __name__ == "__main__":

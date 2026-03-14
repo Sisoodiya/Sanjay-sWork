@@ -112,8 +112,8 @@ def augment_training_data(eeg_2d, ecg_2d, labels_oh,
     """
     Generate augmented copies and append them to the original training data.
 
-    Creates `augment_ratio` × N new augmented samples (applied to a
-    random subset of originals), then concatenates with the originals.
+    Memory-optimized: uses float16 and pre-allocates the final array to
+    avoid the 3x memory spike typical of `np.concatenate`.
 
     Args:
         eeg_2d: (N, 128, 9, 9) training EEG.
@@ -137,13 +137,24 @@ def augment_training_data(eeg_2d, ecg_2d, labels_oh,
     if n_aug == 0:
         return eeg_2d, ecg_2d, labels_oh
 
-    # Randomly sample indices to augment
+    # Randomly sample indices
     idx = np.random.choice(N, size=n_aug, replace=True)
+
+    # Pre-allocate full output arrays in float16
+    out_N = N + n_aug
+    eeg_out = np.empty((out_N,) + eeg_2d.shape[1:], dtype=np.float16)
+    ecg_out = np.empty((out_N,) + ecg_2d.shape[1:], dtype=np.float16)
+    labels_out = np.empty((out_N,) + labels_oh.shape[1:], dtype=labels_oh.dtype)
+
+    # Copy originals
+    eeg_out[:N] = eeg_2d
+    ecg_out[:N] = ecg_2d
+    labels_out[:N] = labels_oh
+
+    # Generate and write augmentations directly into the pre-allocated slice
     eeg_aug = eeg_2d[idx].copy()
     ecg_aug = ecg_2d[idx].copy()
-    labels_aug = labels_oh[idx].copy()
-
-    # Apply augmentations to the copies
+    
     eeg_aug = time_shift(eeg_aug)
     eeg_aug = channel_dropout(eeg_aug)
     eeg_aug = gaussian_noise(eeg_aug)
@@ -152,11 +163,13 @@ def augment_training_data(eeg_2d, ecg_2d, labels_oh,
     ecg_aug = gaussian_noise(ecg_aug)
     ecg_aug = amplitude_scale(ecg_aug)
 
-    # Concatenate originals + augmented
-    eeg_out = np.concatenate([eeg_2d, eeg_aug], axis=0)
-    ecg_out = np.concatenate([ecg_2d, ecg_aug], axis=0)
-    labels_out = np.concatenate([labels_oh, labels_aug], axis=0)
+    eeg_out[N:] = eeg_aug
+    ecg_out[N:] = ecg_aug
+    labels_out[N:] = labels_oh[idx]
 
-    # Shuffle the combined data
-    perm = np.random.permutation(len(eeg_out))
+    # Free intermediates BEFORE shuffle
+    del eeg_2d, ecg_2d, labels_oh, eeg_aug, ecg_aug
+
+    # Shuffle inplace iteratively to save memory
+    perm = np.random.permutation(out_N)
     return eeg_out[perm], ecg_out[perm], labels_out[perm]

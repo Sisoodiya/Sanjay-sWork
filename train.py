@@ -26,62 +26,63 @@ from src.evaluate import (
 )
 
 
-def prepare_fold_data(dataset, test_subject_idx, target):
+def prepare_and_transform_fold(dataset, test_subject_idx, target):
     """
-    Split dataset into train, validation, and test for one LOSOCV fold.
-
-    Uses a separate training subject as validation to avoid data leakage.
-    The validation subject is chosen as the one immediately before the test
-    subject (wrapping around), ensuring the test subject is never used for
-    EarlyStopping or ReduceLROnPlateau decisions.
-
-    Args:
-        dataset: List of 23 subject dicts from build_dataset().
-        test_subject_idx: Index of the held-out test subject.
-        target: 'valence', 'arousal', or 'dominance'.
-    Returns:
-        (train_eeg, train_ecg, train_labels,
-         val_eeg, val_ecg, val_labels,
-         test_eeg, test_ecg, test_labels)
+    Memory-efficient stream-processing of a LOSOCV fold.
+    
+    Instead of building giant raw arrays and then transforming them
+    (which spikes RAM), this builds the final 2D float16 arrays directly.
     """
     label_key = f"labels_{target}"
     n_subjects = len(dataset)
-
-    # Pick a validation subject: the one before the test subject (wrapping)
     val_subject_idx = (test_subject_idx - 1) % n_subjects
 
-    train_eeg, train_ecg, train_labels = [], [], []
+    # 1. Count segments to pre-allocate float16 arrays
+    n_train = sum(len(s[label_key]) for i, s in enumerate(dataset) 
+                  if i not in (test_subject_idx, val_subject_idx))
+    n_val = len(dataset[val_subject_idx][label_key])
+    n_test = len(dataset[test_subject_idx][label_key])
+
+    # Pre-allocate train arrays in float16
+    train_eeg_2d = np.empty((n_train, 128, 9, 9), dtype=np.float16)
+    train_ecg_2d = np.empty((n_train, 64, 64, 6), dtype=np.float16)
+    train_labels = np.empty(n_train, dtype=dataset[0][label_key].dtype)
+
+    # Process train subjects one by one
+    print(f"  Transforming {n_train} training segments (21 subjects)...")
+    idx = 0
     for i, subj in enumerate(dataset):
         if i == test_subject_idx or i == val_subject_idx:
             continue
-        train_eeg.append(subj["eeg_segments"])
-        train_ecg.append(subj["ecg_segments"])
-        train_labels.append(subj[label_key])
+        n_subj = len(subj[label_key])
+        train_eeg_2d[idx:idx+n_subj] = transform_eeg_batch(subj["eeg_segments"])
+        train_ecg_2d[idx:idx+n_subj] = transform_ecg_batch(subj["ecg_segments"])
+        train_labels[idx:idx+n_subj] = subj[label_key]
+        idx += n_subj
+        gc.collect()
 
-    train_eeg = np.concatenate(train_eeg, axis=0)
-    train_ecg = np.concatenate(train_ecg, axis=0)
-    train_labels = np.concatenate(train_labels, axis=0)
+    # Process validation subject
+    print(f"  Transforming {n_val} validation segments (subject {val_subject_idx})...")
+    val_subj = dataset[val_subject_idx]
+    val_eeg_2d = transform_eeg_batch(val_subj["eeg_segments"])
+    val_ecg_2d = transform_ecg_batch(val_subj["ecg_segments"])
+    val_labels = val_subj[label_key]
+    gc.collect()
 
-    val_eeg = dataset[val_subject_idx]["eeg_segments"]
-    val_ecg = dataset[val_subject_idx]["ecg_segments"]
-    val_labels = dataset[val_subject_idx][label_key]
+    # Process test subject
+    print(f"  Transforming {n_test} test segments (subject {test_subject_idx})...")
+    test_subj = dataset[test_subject_idx]
+    test_eeg_2d = transform_eeg_batch(test_subj["eeg_segments"])
+    test_ecg_2d = transform_ecg_batch(test_subj["ecg_segments"])
+    test_labels = test_subj[label_key]
+    gc.collect()
 
-    test_eeg = dataset[test_subject_idx]["eeg_segments"]
-    test_ecg = dataset[test_subject_idx]["ecg_segments"]
-    test_labels = dataset[test_subject_idx][label_key]
-
-    return (train_eeg, train_ecg, train_labels,
-            val_eeg, val_ecg, val_labels,
-            test_eeg, test_ecg, test_labels)
+    return (train_eeg_2d, train_ecg_2d, train_labels,
+            val_eeg_2d, val_ecg_2d, val_labels,
+            test_eeg_2d, test_ecg_2d, test_labels)
 
 
-def apply_transforms(eeg_segments, ecg_segments):
-    """Apply 2D transformations to raw segments."""
-    print("  Applying EEG 2D grid transform...")
-    eeg_2d = transform_eeg_batch(eeg_segments)
-    print("  Applying ECG 2D transforms (GAF+RP+MTF)...")
-    ecg_2d = transform_ecg_batch(ecg_segments)
-    return eeg_2d, ecg_2d
+
 
 
 def losocv_train(dataset, target="valence", num_subjects=None, save_dir=None):
@@ -111,27 +112,16 @@ def losocv_train(dataset, target="valence", num_subjects=None, save_dir=None):
         print(f"LOSOCV Fold {fold + 1}/{num_subjects} — Test Subject: {fold}")
         print(f"{'=' * 60}")
 
-        # Split data (train / validation / test)
-        (train_eeg, train_ecg, train_labels,
-         val_eeg, val_ecg, val_labels,
-         test_eeg, test_ecg, test_labels) = prepare_fold_data(dataset, fold, target)
+        # Split and transform data directly into float16
+        (train_eeg_2d, train_ecg_2d, train_labels,
+         val_eeg_2d, val_ecg_2d, val_labels,
+         test_eeg_2d, test_ecg_2d, test_labels) = prepare_and_transform_fold(
+             dataset, fold, target)
 
         val_subject_idx = (fold - 1) % len(dataset)
         print(f"  Train: {len(train_labels)} segments (21 subjects), "
               f"Val: {len(val_labels)} segments (subject {val_subject_idx}), "
               f"Test: {len(test_labels)} segments (subject {fold})")
-
-        # Apply 2D transforms
-        print("  Transforming training data...")
-        train_eeg_2d, train_ecg_2d = apply_transforms(train_eeg, train_ecg)
-        del train_eeg, train_ecg  # Free raw segments (~21 subjects)
-        print("  Transforming validation data...")
-        val_eeg_2d, val_ecg_2d = apply_transforms(val_eeg, val_ecg)
-        del val_eeg, val_ecg
-        print("  Transforming test data...")
-        test_eeg_2d, test_ecg_2d = apply_transforms(test_eeg, test_ecg)
-        del test_eeg, test_ecg
-        gc.collect()  # Force garbage collection to reclaim freed memory
 
         # One-hot encode labels
         train_labels_oh = to_categorical(train_labels, config.NUM_CLASSES)
