@@ -240,6 +240,11 @@ def main():
                         help="Path to DREAMER.mat")
     args = parser.parse_args()
 
+    # Enable Mixed Precision to handle float16 inputs efficiently
+    # and utilize the T4 GPU's Tensor Cores for massive speedups.
+    tf.keras.mixed_precision.set_global_policy("mixed_float16")
+    print("Enabled Mixed Precision (float16) for GPU Tensor Cores.")
+
     set_seed(config.RANDOM_SEED)
 
     # Build preprocessed dataset

@@ -9,7 +9,18 @@ Uses CuPy for GPU acceleration when available, falls back to NumPy.
 import numpy as np
 
 from src import config
-from src.utils import get_xp, to_numpy, HAS_CUPY
+
+def get_xp():
+    """Return cupy if available, else numpy."""
+    return cp if HAS_CUPY else np
+
+def to_numpy(x):
+    """Convert cupy/torch array to numpy if needed."""
+    if HAS_CUPY and isinstance(x, cp.ndarray):
+        return cp.asnumpy(x)
+    if HAS_TORCH and torch.is_tensor(x):
+        return x.cpu().numpy()
+    return x
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -251,13 +262,12 @@ def _batch_mtf(signals, image_size, n_bins, xp):
     to_bins = binned[:, 1:]     # (N, S-1)
 
     # Flatten to 1D index: sample * n_bins * n_bins + from_bin * n_bins + to_bin
-    sample_idx = xp.arange(N)[:, None] * (n_bins * n_bins)  # (N, 1)
-    flat_idx = sample_idx + from_bins * n_bins + to_bins      # (N, S-1)
-    flat_idx = flat_idx.reshape(-1)
+    sample_idx = xp.arange(N, dtype=xp.int32)[:, None] * (n_bins * n_bins)
+    flat_idx = (sample_idx + from_bins * n_bins + to_bins).reshape(-1)
 
     tm_flat = xp.zeros(N * n_bins * n_bins, dtype=xp.float32)
     if HAS_CUPY:
-        xp.add.at(tm_flat, flat_idx, 1)
+        xp.add.at(tm_flat, flat_idx.astype(xp.int32), 1)
     else:
         np.add.at(tm_flat, flat_idx.astype(int), 1)
     tm = tm_flat.reshape(N, n_bins, n_bins)  # (N, n_bins, n_bins)
@@ -297,13 +307,18 @@ def transform_ecg_batch(ecg_segments, image_size=None):
     N = ecg_segments.shape[0]
     chunk_size = config.TRANSFORM_BATCH_SIZE
 
-    # Pre-allocate output array (use float16 to save RAM)
+    # Pre-allocate output array in float16 to save RAM during transforms
     result = np.empty((N, image_size, image_size, 6), dtype=np.float16)
 
     for start in range(0, N, chunk_size):
         end = min(start + chunk_size, N)
+        segs_chunk = ecg_segments[start:end]
+        
+        # If using standard Colab without CuPy, we can use TensorFlow for math
+        # to ensure it uses the GPU, but for now we keep it simple and rely on TF 
+        # inside the training loop. We just fix the numpy/cupy precision here.
         xp = get_xp()
-        segs = xp.asarray(ecg_segments[start:end])
+        segs = xp.asarray(segs_chunk, dtype=xp.float32)
 
         all_channels = []
         for ch in range(segs.shape[2]):
