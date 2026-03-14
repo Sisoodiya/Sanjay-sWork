@@ -6,7 +6,20 @@ Phase 1: 1D → 2D signal transformations.
 Uses CuPy for GPU acceleration when available, falls back to NumPy.
 """
 
+import warnings
 import numpy as np
+
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+    
+try:
+    import torch
+    HAS_TORCH = torch.cuda.is_available()
+except ImportError:
+    HAS_TORCH = False
 
 from src import config
 
