@@ -241,9 +241,9 @@ def build_dataset(mat_path=None):
     """
     all_subjects = load_all_subjects(mat_path)
     total = len(all_subjects)
-    print(f"Preprocessing {total} subjects in parallel...")
+    print(f"Preprocessing {total} subjects...")
 
-    dataset = Parallel(n_jobs=-1, prefer='threads')(
+    dataset = Parallel(n_jobs=2, prefer='threads')(
         delayed(_preprocess_subject)(subj, i, total)
         for i, subj in enumerate(all_subjects)
     )
