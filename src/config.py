@@ -65,6 +65,10 @@ ECG_IMAGE_SIZE = 64    # Output resolution for GAF/RP/MTF images
 ECG_IMAGE_CHANNELS = 6 # 2 ECG channels × 3 transforms (GAF, RP, MTF)
 TRANSFORM_BATCH_SIZE = 500  # Process ECG transforms in chunks to cap peak RAM
 
+# ── Data Pipeline (tf.data) ─────────────────────────────────────────────────
+SUBJECTS_CACHE_DIR = os.path.join(BASE_DIR, "data", "subjects")
+SHUFFLE_BUFFER_SIZE = 2000  # tf.data shuffle buffer (samples)
+
 # ── Transformer Config ────────────────────────────────────────────────────────
 D_MODEL = 64
 NUM_HEADS = 4

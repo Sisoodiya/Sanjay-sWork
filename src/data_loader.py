@@ -52,10 +52,10 @@ def extract_subject_data(dreamer, subject_idx):
         eeg_base = subject["EEG"][0, 0]["baseline"][0, 0][trial_idx, 0]
         ecg_base = subject["ECG"][0, 0]["baseline"][0, 0][trial_idx, 0]
 
-        eeg_stimuli.append(eeg_stim.astype(np.float64))
-        ecg_stimuli.append(ecg_stim.astype(np.float64))
-        eeg_baseline.append(eeg_base.astype(np.float64))
-        ecg_baseline.append(ecg_base.astype(np.float64))
+        eeg_stimuli.append(eeg_stim.astype(np.float32))
+        ecg_stimuli.append(ecg_stim.astype(np.float32))
+        eeg_baseline.append(eeg_base.astype(np.float32))
+        ecg_baseline.append(ecg_base.astype(np.float32))
 
     valence = subject["ScoreValence"][0, 0].flatten().astype(int)
     arousal = subject["ScoreArousal"][0, 0].flatten().astype(int)

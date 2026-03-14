@@ -12,93 +12,36 @@ import gc
 import argparse
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.utils import to_categorical
 
 from src import config
 from src.utils import set_seed, get_class_weights, ensure_dir
-from src.preprocessing import build_dataset
-from src.transforms import transform_ecg_batch, transform_eeg_batch
-from src.augmentation import augment_training_data
 from src.model import build_model
 from src.evaluate import (
     compute_metrics, print_classification_report,
     plot_confusion_matrix, print_results_table,
 )
+from src.data_pipeline import (
+    save_subject_files, subjects_cache_exists,
+    make_training_dataset, load_eval_data,
+    count_training_samples, get_training_labels,
+)
 
 
-def prepare_and_transform_fold(dataset, test_subject_idx, target):
+def losocv_train(target="valence", num_subjects=None, save_dir=None):
     """
-    Memory-efficient stream-processing of a LOSOCV fold.
-    
-    Instead of building giant raw arrays and then transforming them
-    (which spikes RAM), this builds the final 2D float16 arrays directly.
-    """
-    label_key = f"labels_{target}"
-    n_subjects = len(dataset)
-    val_subject_idx = (test_subject_idx - 1) % n_subjects
+    Run Leave-One-Subject-Out Cross-Validation using tf.data streaming.
 
-    # 1. Count segments to pre-allocate float16 arrays
-    n_train = sum(len(s[label_key]) for i, s in enumerate(dataset) 
-                  if i not in (test_subject_idx, val_subject_idx))
-    n_val = len(dataset[val_subject_idx][label_key])
-    n_test = len(dataset[test_subject_idx][label_key])
-
-    # Pre-allocate train arrays in float16
-    train_eeg_2d = np.empty((n_train, 128, 9, 9), dtype=np.float16)
-    train_ecg_2d = np.empty((n_train, 64, 64, 6), dtype=np.float16)
-    train_labels = np.empty(n_train, dtype=dataset[0][label_key].dtype)
-
-    # Process train subjects one by one
-    print(f"  Transforming {n_train} training segments (21 subjects)...")
-    idx = 0
-    for i, subj in enumerate(dataset):
-        if i == test_subject_idx or i == val_subject_idx:
-            continue
-        n_subj = len(subj[label_key])
-        train_eeg_2d[idx:idx+n_subj] = transform_eeg_batch(subj["eeg_segments"])
-        train_ecg_2d[idx:idx+n_subj] = transform_ecg_batch(subj["ecg_segments"])
-        train_labels[idx:idx+n_subj] = subj[label_key]
-        idx += n_subj
-        gc.collect()
-
-    # Process validation subject
-    print(f"  Transforming {n_val} validation segments (subject {val_subject_idx})...")
-    val_subj = dataset[val_subject_idx]
-    val_eeg_2d = transform_eeg_batch(val_subj["eeg_segments"])
-    val_ecg_2d = transform_ecg_batch(val_subj["ecg_segments"])
-    val_labels = val_subj[label_key]
-    gc.collect()
-
-    # Process test subject
-    print(f"  Transforming {n_test} test segments (subject {test_subject_idx})...")
-    test_subj = dataset[test_subject_idx]
-    test_eeg_2d = transform_eeg_batch(test_subj["eeg_segments"])
-    test_ecg_2d = transform_ecg_batch(test_subj["ecg_segments"])
-    test_labels = test_subj[label_key]
-    gc.collect()
-
-    return (train_eeg_2d, train_ecg_2d, train_labels,
-            val_eeg_2d, val_ecg_2d, val_labels,
-            test_eeg_2d, test_ecg_2d, test_labels)
-
-
-
-
-
-def losocv_train(dataset, target="valence", num_subjects=None, save_dir=None):
-    """
-    Run Leave-One-Subject-Out Cross-Validation.
+    Data is loaded from per-subject .npy files on disk. At most one
+    subject's 2D data (~76 MB) is in RAM at a time during training.
 
     Args:
-        dataset: List of subject dicts from build_dataset().
         target: 'valence', 'arousal', or 'dominance'.
-        num_subjects: Number of subjects to evaluate (for testing; default: all 23).
+        num_subjects: Number of folds to run (default: all 23).
         save_dir: Directory to save results.
     Returns:
         List of per-subject result dicts.
     """
-    if num_subjects is None:
-        num_subjects = len(dataset)
+    n_total = num_subjects if num_subjects else config.NUM_SUBJECTS
     if save_dir is None:
         save_dir = os.path.join(config.SAVE_DIR, target)
     ensure_dir(save_dir)
@@ -107,40 +50,39 @@ def losocv_train(dataset, target="valence", num_subjects=None, save_dir=None):
     all_y_pred = []
     subject_results = []
 
-    for fold in range(num_subjects):
+    for fold in range(n_total):
         print(f"\n{'=' * 60}")
-        print(f"LOSOCV Fold {fold + 1}/{num_subjects} — Test Subject: {fold}")
+        print(f"LOSOCV Fold {fold + 1}/{n_total} — Test Subject: {fold}")
         print(f"{'=' * 60}")
 
-        # Split and transform data directly into float16
-        (train_eeg_2d, train_ecg_2d, train_labels,
-         val_eeg_2d, val_ecg_2d, val_labels,
-         test_eeg_2d, test_ecg_2d, test_labels) = prepare_and_transform_fold(
-             dataset, fold, target)
+        val_subject_idx = (fold - 1) % config.NUM_SUBJECTS
+        train_indices = [i for i in range(config.NUM_SUBJECTS)
+                         if i != fold and i != val_subject_idx]
 
-        val_subject_idx = (fold - 1) % len(dataset)
-        print(f"  Train: {len(train_labels)} segments (21 subjects), "
-              f"Val: {len(val_labels)} segments (subject {val_subject_idx}), "
-              f"Test: {len(test_labels)} segments (subject {fold})")
+        # Build tf.data training pipeline (streams from disk)
+        train_ds = make_training_dataset(train_indices, target)
 
-        # One-hot encode labels
-        train_labels_oh = to_categorical(train_labels, config.NUM_CLASSES)
-        val_labels_oh = to_categorical(val_labels, config.NUM_CLASSES)
-        test_labels_oh = to_categorical(test_labels, config.NUM_CLASSES)
+        # Load val/test as numpy (one subject each, ~76 MB)
+        val_eeg, val_ecg, val_labels, val_labels_oh = load_eval_data(
+            val_subject_idx, target)
+        test_eeg, test_ecg, test_labels, test_labels_oh = load_eval_data(
+            fold, target)
 
-        # Data augmentation (training data only)
-        n_before = len(train_labels_oh)
-        train_eeg_2d, train_ecg_2d, train_labels_oh = augment_training_data(
-            train_eeg_2d, train_ecg_2d, train_labels_oh,
-        )
-        print(f"  Augmentation: {n_before} → {len(train_labels_oh)} training segments")
+        # Class weights (loads only small label arrays)
+        train_labels_flat = get_training_labels(train_indices, target)
+        class_weights = get_class_weights(train_labels_flat)
+        del train_labels_flat
 
-        # Class weights
-        class_weights = get_class_weights(train_labels)
+        # Steps per epoch for LR schedule
+        n_train_total = count_training_samples(train_indices, target)
+        steps_per_epoch = n_train_total // config.BATCH_SIZE + 1
+
+        print(f"  Train: ~{n_train_total} samples (21 subjects + aug), "
+              f"Val: {len(val_labels)} (subject {val_subject_idx}), "
+              f"Test: {len(test_labels)} (subject {fold})")
         print(f"  Class weights: {class_weights}")
 
         # Build LR schedule (warmup + cosine decay)
-        steps_per_epoch = len(train_labels_oh) // config.BATCH_SIZE + 1
         if config.LR_USE_COSINE_DECAY:
             from src.lr_schedule import build_lr_schedule
             lr_schedule = build_lr_schedule(steps_per_epoch)
@@ -148,10 +90,10 @@ def losocv_train(dataset, target="valence", num_subjects=None, save_dir=None):
         else:
             lr_schedule = None
 
-        # Build model (fresh for each fold; passes class weights for focal loss)
+        # Build model (fresh for each fold)
         model = build_model(lr_schedule=lr_schedule, class_weights=class_weights)
 
-        # Callbacks (monitor validation loss — from a separate subject, not test)
+        # Callbacks
         callbacks = [
             tf.keras.callbacks.EarlyStopping(
                 monitor="val_loss",
@@ -159,7 +101,6 @@ def losocv_train(dataset, target="valence", num_subjects=None, save_dir=None):
                 restore_best_weights=True,
             ),
         ]
-        # Only add ReduceLROnPlateau when NOT using cosine decay schedule
         if not config.LR_USE_COSINE_DECAY:
             callbacks.append(tf.keras.callbacks.ReduceLROnPlateau(
                 monitor="val_loss",
@@ -167,24 +108,21 @@ def losocv_train(dataset, target="valence", num_subjects=None, save_dir=None):
                 patience=config.REDUCE_LR_PATIENCE,
             ))
 
-        # When using focal loss, class weights are handled by the loss's alpha
-        # parameter — do NOT also pass class_weight to model.fit (double-counting)
         fit_class_weight = None if config.USE_FOCAL_LOSS else class_weights
 
-        # Train (validation data is a separate subject, NOT the test subject)
+        # Train with tf.data pipeline (no numpy copy overhead)
         model.fit(
-            [train_eeg_2d, train_ecg_2d],
-            train_labels_oh,
-            validation_data=([val_eeg_2d, val_ecg_2d], val_labels_oh),
-            batch_size=config.BATCH_SIZE,
+            train_ds,
+            validation_data=([val_eeg, val_ecg], val_labels_oh),
             epochs=config.EPOCHS,
+            steps_per_epoch=steps_per_epoch,
             class_weight=fit_class_weight,
             callbacks=callbacks,
             verbose=1,
         )
 
         # Predict
-        pred_probs = model.predict([test_eeg_2d, test_ecg_2d], verbose=0)
+        pred_probs = model.predict([test_eeg, test_ecg], verbose=0)
         y_pred = np.argmax(pred_probs, axis=1)
         y_true = test_labels
 
@@ -208,9 +146,8 @@ def losocv_train(dataset, target="valence", num_subjects=None, save_dir=None):
         model.save_weights(os.path.join(save_dir, f"model_fold_{fold}.weights.h5"))
 
         # Clear session and free memory
-        del train_eeg_2d, train_ecg_2d, train_labels_oh
-        del val_eeg_2d, val_ecg_2d, val_labels_oh
-        del test_eeg_2d, test_ecg_2d, test_labels_oh
+        del train_ds, val_eeg, val_ecg, val_labels_oh
+        del test_eeg, test_ecg, test_labels_oh
         del model
         tf.keras.backend.clear_session()
         gc.collect()
@@ -247,10 +184,19 @@ def main():
 
     set_seed(config.RANDOM_SEED)
 
-    # Build preprocessed dataset
-    print("Building preprocessed dataset...")
-    dataset = build_dataset(args.data)
+    # Ensure per-subject 2D cache exists on disk
+    if not subjects_cache_exists():
+        print("Building per-subject 2D cache (one-time)...")
+        from src.preprocessing import build_dataset
+        dataset = build_dataset(args.data)
+        save_subject_files(dataset)
+        del dataset
+        gc.collect()
+        print("Per-subject 2D cache ready.\n")
+    else:
+        print("Per-subject 2D cache found. Skipping preprocessing.\n")
 
+    # Run LOSOCV — data streams from disk, no dataset object in memory
     targets = config.TARGETS if args.target == "all" else [args.target]
     all_results = {}
 
@@ -258,7 +204,7 @@ def main():
         print(f"\n{'#' * 70}")
         print(f"  TRAINING: {target.upper()}")
         print(f"{'#' * 70}")
-        results = losocv_train(dataset, target=target, num_subjects=args.subjects)
+        results = losocv_train(target=target, num_subjects=args.subjects)
         all_results[target] = results
 
     # Print summary table

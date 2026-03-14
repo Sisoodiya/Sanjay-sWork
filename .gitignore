@@ -1,5 +1,6 @@
 # Data files (DREAMER.mat is tracked via Git LFS)
 data/preprocessed_cache.npz
+data/subjects/
 
 # Results (generated at runtime)
 results/
