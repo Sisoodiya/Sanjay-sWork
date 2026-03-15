@@ -2,6 +2,7 @@
 Phase 2: Transformer Encoder modules for EEG and ECG feature extraction.
 """
 
+import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
 
@@ -11,7 +12,10 @@ from src.spatial_encoding import SpatialPositionEncoding, TemporalPositionEncodi
 
 class TransformerEncoderBlock(layers.Layer):
     """
-    Single Transformer Encoder block: MultiHeadAttention → Add&Norm → FFN → Add&Norm.
+    Pre-LN Transformer Encoder block with GELU activation.
+
+    Pre-LN pattern (norm before attention/FFN) provides more stable gradient flow
+    than Post-LN, especially with warmup LR schedules.
     """
 
     def __init__(self, d_model=None, num_heads=None, ff_dim=None, dropout=None, **kwargs):
@@ -27,7 +31,7 @@ class TransformerEncoderBlock(layers.Layer):
             key_dim=self.d_model // self.num_heads,
         )
         self.ffn = tf.keras.Sequential([
-            layers.Dense(self.ff_dim, activation="relu"),
+            layers.Dense(self.ff_dim, activation="gelu"),
             layers.Dense(self.d_model),
         ])
         self.norm1 = layers.LayerNormalization(epsilon=1e-6)
@@ -37,14 +41,16 @@ class TransformerEncoderBlock(layers.Layer):
         super().build(input_shape)
 
     def call(self, x, training=False):
-        # Self-attention
-        attn_out = self.mha(x, x, x)
+        # Pre-LN: norm → attention → add
+        x_norm = self.norm1(x)
+        attn_out = self.mha(x_norm, x_norm, x_norm)
         attn_out = self.dropout1(attn_out, training=training)
-        x = self.norm1(x + attn_out)
-        # Feed-forward
-        ffn_out = self.ffn(x)
+        x = x + attn_out
+        # Pre-LN: norm → FFN → add
+        x_norm = self.norm2(x)
+        ffn_out = self.ffn(x_norm, training=training)
         ffn_out = self.dropout2(ffn_out, training=training)
-        x = self.norm2(x + ffn_out)
+        x = x + ffn_out
         return x
 
     def get_config(self):
@@ -60,11 +66,10 @@ class TransformerEncoderBlock(layers.Layer):
 
 class SpatialAttentionPooling(layers.Layer):
     """
-    Learnable attention-weighted pooling over spatial tokens.
+    Learnable attention-weighted pooling over spatial tokens with masking.
 
-    Instead of mean-pooling (which equally weights all 81 grid positions
-    including the ~67 zero-padded ones), this learns to weight the 14
-    electrode positions differently.
+    Masks zero-padded grid positions (67 of 81) so attention is concentrated
+    on the 14 real electrode positions.
 
     Input:  (batch, timesteps, num_spatial_tokens, d_model)
     Output: (batch, timesteps, d_model)
@@ -76,11 +81,26 @@ class SpatialAttentionPooling(layers.Layer):
 
     def build(self, input_shape):
         self.attn_dense = layers.Dense(1, use_bias=True, name="spatial_attn_score")
+        # Static mask: 1.0 for valid electrode positions, 0.0 for padding
+        mask = np.zeros(
+            (1, 1, config.EEG_GRID_SIZE * config.EEG_GRID_SIZE, 1),
+            dtype=np.float32,
+        )
+        for ch_idx, (row, col) in config.EEG_GRID_MAP.items():
+            pos = row * config.EEG_GRID_SIZE + col
+            mask[0, 0, pos, 0] = 1.0
+        self.valid_mask = self.add_weight(
+            name="valid_mask", shape=mask.shape,
+            initializer=tf.keras.initializers.Constant(mask),
+            trainable=False,
+        )
         super().build(input_shape)
 
     def call(self, x):
         # x: (batch, timesteps, num_tokens, d_model)
         scores = self.attn_dense(x)  # (batch, timesteps, num_tokens, 1)
+        # Mask zero-padded positions: set scores to -inf before softmax
+        scores = scores + (1.0 - self.valid_mask) * (-1e9)
         weights = tf.nn.softmax(scores, axis=2)  # Softmax over spatial dim
         pooled = tf.reduce_sum(x * weights, axis=2)  # (batch, timesteps, d_model)
         return pooled
@@ -96,12 +116,8 @@ class EEGTransformerEncoder(layers.Layer):
     EEG feature extractor with deferred spatial pooling (memory-efficient):
       (batch, 128, 9, 9) → SpatialPositionEncoding → (batch, 128, 81, d_model)
       → Lightweight spatial mixing (Dense, not full Transformer — saves ~10× RAM)
-      → Learnable spatial attention pooling → (batch, 128, d_model)
+      → Learnable spatial attention pooling with masking → (batch, 128, d_model)
       → Temporal positional encoding → Transformer stack → (batch, 128, d_model)
-
-    Uses a Dense layer for spatial mixing instead of a full Transformer block
-    over 81 tokens, which would create batch×128×81×81 attention matrices and
-    cause OOM on Colab's T4 (15GB VRAM, ~12GB RAM).
     """
 
     def __init__(self, d_model=None, num_heads=None, ff_dim=None,
@@ -120,11 +136,11 @@ class EEGTransformerEncoder(layers.Layer):
         # Lightweight spatial mixing: learns inter-electrode relationships
         # without the O(n²) memory cost of MultiHeadAttention over 81 tokens
         self.spatial_mix = tf.keras.Sequential([
-            layers.Dense(self.ff_dim, activation="relu", name="spatial_mix_up"),
+            layers.Dense(self.ff_dim, activation="gelu", name="spatial_mix_up"),
             layers.Dense(self.d_model, name="spatial_mix_down"),
         ], name="eeg_spatial_mix")
         self.spatial_norm = layers.LayerNormalization(epsilon=1e-6, name="spatial_mix_norm")
-        # Learnable spatial attention pooling (replaces mean pooling)
+        # Learnable spatial attention pooling with masking (replaces mean pooling)
         self.spatial_pool = SpatialAttentionPooling(
             d_model=self.d_model, name="eeg_spatial_pool"
         )
@@ -152,10 +168,7 @@ class EEGTransformerEncoder(layers.Layer):
         # Spatial encoding: (batch, 128, 81, d_model)
         x = self.spatial_encoding(x)
 
-        # Lightweight spatial mixing: (batch, 128, 81, d_model)
-        # Applies Dense to each spatial token independently (shared across tokens),
-        # then residual + norm — learns to transform spatial features without
-        # creating 81×81 attention matrices
+        # Lightweight spatial mixing with residual + norm
         x = self.spatial_norm(x + self.spatial_mix(x))
 
         # Learnable attention pooling over spatial tokens: (batch, 128, d_model)
@@ -226,7 +239,7 @@ class ECGPatchEmbedding(layers.Layer):
 class ECGTransformerEncoder(layers.Layer):
     """
     ECG feature extractor:
-      (batch, 64, 64, 6) → PatchEmbedding → PositionalEncoding →
+      (batch, 64, 64, 6) → PatchEmbedding → LayerNorm → PositionalEncoding →
       TransformerEncoder stack → (batch, num_patches, d_model)
     """
 
@@ -244,6 +257,9 @@ class ECGTransformerEncoder(layers.Layer):
         self.patch_embedding = ECGPatchEmbedding(
             patch_size=self.patch_size, d_model=self.d_model,
             name="ecg_patch_embed"
+        )
+        self.patch_norm = layers.LayerNormalization(
+            epsilon=1e-6, name="ecg_patch_norm"
         )
         self.temporal_pos = TemporalPositionEncoding(
             max_len=256, d_model=self.d_model, name="ecg_temporal_pos"
@@ -265,8 +281,9 @@ class ECGTransformerEncoder(layers.Layer):
         Returns:
             (batch, num_patches, d_model)
         """
-        # Patch embedding: (batch, 64, d_model)
+        # Patch embedding + normalization: (batch, 64, d_model)
         x = self.patch_embedding(x)
+        x = self.patch_norm(x)
         # Positional encoding
         x = self.temporal_pos(x)
         # Transformer blocks

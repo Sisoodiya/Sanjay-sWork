@@ -177,12 +177,14 @@ def apply_ica(signal, n_components=None):
         ica = CuMLFastICA(n_components=n_components, max_iter=200, tol=1e-3,
                           random_state=config.RANDOM_SEED)
         sources = ica.fit_transform(sig_gpu)
-        sources = cp.asnumpy(sources)
-        artifact_idx = _identify_artifact_components(sources, signal)
+        sources_np = cp.asnumpy(sources)
+        artifact_idx = _identify_artifact_components(sources_np, signal)
         if artifact_idx:
-            sources[:, artifact_idx] = 0
-        mixing = cp.asnumpy(ica.mixing_)
-        return sources @ mixing.T + np.mean(signal, axis=0)
+            sources_np[:, artifact_idx] = 0
+            sources = cp.asarray(sources_np)
+        # Use inverse_transform for consistent reconstruction (matches sklearn path)
+        cleaned = ica.inverse_transform(sources)
+        return cp.asnumpy(cleaned) if isinstance(cleaned, cp.ndarray) else np.asarray(cleaned)
 
     # Fallback: sklearn CPU
     with warnings.catch_warnings():
@@ -313,7 +315,7 @@ def clear_cache(path=CACHE_PATH):
 # ── Full Dataset Builder ──────────────────────────────────────────────────────
 
 def _preprocess_subject(subj, subj_idx, total):
-    """Preprocess all trials for one subject."""
+    """Preprocess all trials for one subject with baseline normalization."""
     eeg_segments_all, ecg_segments_all = [], []
     labels_v, labels_a, labels_d = [], [], []
 
@@ -325,11 +327,35 @@ def _preprocess_subject(subj, subj_idx, total):
         eeg = preprocess_eeg(subj["eeg_stimuli"][trial_idx])
         ecg = preprocess_ecg(subj["ecg_stimuli"][trial_idx])
 
+        # Baseline normalization: normalize stimuli relative to resting state.
+        # Removes inter-subject amplitude differences — standard for DREAMER.
+        eeg_base = preprocess_eeg(subj["eeg_baseline"][trial_idx])
+        ecg_base = preprocess_ecg(subj["ecg_baseline"][trial_idx])
+
+        eeg_base_mean = np.mean(eeg_base, axis=0, keepdims=True)  # (1, 14)
+        eeg_base_std = np.std(eeg_base, axis=0, keepdims=True)    # (1, 14)
+        eeg_base_std = np.where(eeg_base_std < 1e-8, 1.0, eeg_base_std)
+        eeg = (eeg - eeg_base_mean) / eeg_base_std
+
+        ecg_base_mean = np.mean(ecg_base, axis=0, keepdims=True)  # (1, 2)
+        ecg_base_std = np.std(ecg_base, axis=0, keepdims=True)    # (1, 2)
+        ecg_base_std = np.where(ecg_base_std < 1e-8, 1.0, ecg_base_std)
+        ecg = (ecg - ecg_base_mean) / ecg_base_std
+
         eeg = extract_last_n_seconds(eeg, config.EEG_SR)
         ecg = extract_last_n_seconds(ecg, config.ECG_SR)
 
         eeg_segs = segment_signal(eeg, config.EEG_SR)   # (N, 128, 14)
         ecg_segs = segment_signal(ecg, config.ECG_SR)   # (N, 256, 2)
+
+        # Per-segment z-score normalization for EEG
+        # Ensures consistent scale across segments before 9x9 grid mapping
+        for seg_idx in range(len(eeg_segs)):
+            seg = eeg_segs[seg_idx]
+            seg_mean = np.mean(seg)
+            seg_std = np.std(seg)
+            if seg_std > 1e-8:
+                eeg_segs[seg_idx] = (seg - seg_mean) / seg_std
 
         n_segs = min(len(eeg_segs), len(ecg_segs))
         eeg_segments_all.append(eeg_segs[:n_segs])

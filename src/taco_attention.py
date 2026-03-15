@@ -133,12 +133,16 @@ class TACOCrossAttention(layers.Layer):
         self.cca_ecg2eeg = ChannelCrossAttention(
             self.d_model, self.num_heads, self.dropout_rate, name="cca_ecg2eeg"
         )
-        # Projection layers to combine cross-attention outputs (with L2)
-        l2_reg = regularizers.l2(config.L2_WEIGHT_DECAY)
-        self.proj_eeg = layers.Dense(self.d_model, activation="relu",
+        # Projection layers (L2 only when not using AdamW)
+        l2_reg = regularizers.l2(config.L2_WEIGHT_DECAY) if not config.USE_ADAMW else None
+        self.proj_eeg = layers.Dense(self.d_model, activation="gelu",
                                      kernel_regularizer=l2_reg, name="proj_eeg")
-        self.proj_ecg = layers.Dense(self.d_model, activation="relu",
+        self.proj_ecg = layers.Dense(self.d_model, activation="gelu",
                                      kernel_regularizer=l2_reg, name="proj_ecg")
+        self.proj_dropout = layers.Dropout(self.dropout_rate)
+        # Learnable attention pooling (replaces GAP)
+        self.eeg_attn_pool = layers.Dense(1, use_bias=True, name="eeg_seq_attn")
+        self.ecg_attn_pool = layers.Dense(1, use_bias=True, name="ecg_seq_attn")
         self.final_norm = layers.LayerNormalization(epsilon=1e-6, name="taco_final_norm")
         self.final_proj = layers.Dense(self.d_model, kernel_regularizer=l2_reg,
                                        name="taco_final_proj")
@@ -167,10 +171,17 @@ class TACOCrossAttention(layers.Layer):
         fused_ecg = self.proj_ecg(
             tf.concat([tca_ecg, cca_ecg], axis=-1)
         )  # (batch, seq_ecg, d_model)
+        fused_eeg = self.proj_dropout(fused_eeg, training=training)
+        fused_ecg = self.proj_dropout(fused_ecg, training=training)
 
-        # Global average pooling over sequence dimension
-        pooled_eeg = tf.reduce_mean(fused_eeg, axis=1)  # (batch, d_model)
-        pooled_ecg = tf.reduce_mean(fused_ecg, axis=1)   # (batch, d_model)
+        # Learnable attention pooling over sequence dimension
+        eeg_scores = self.eeg_attn_pool(fused_eeg)                    # (batch, seq_eeg, 1)
+        eeg_weights = tf.nn.softmax(eeg_scores, axis=1)               # (batch, seq_eeg, 1)
+        pooled_eeg = tf.reduce_sum(fused_eeg * eeg_weights, axis=1)   # (batch, d_model)
+
+        ecg_scores = self.ecg_attn_pool(fused_ecg)                    # (batch, seq_ecg, 1)
+        ecg_weights = tf.nn.softmax(ecg_scores, axis=1)               # (batch, seq_ecg, 1)
+        pooled_ecg = tf.reduce_sum(fused_ecg * ecg_weights, axis=1)   # (batch, d_model)
 
         # Final fusion
         fused = tf.concat([pooled_eeg, pooled_ecg], axis=-1)  # (batch, 2*d_model)

@@ -72,9 +72,9 @@ SHUFFLE_BUFFER_SIZE = 2000  # tf.data shuffle buffer (samples)
 # ── Transformer Config ────────────────────────────────────────────────────────
 D_MODEL = 64
 NUM_HEADS = 4
-FF_DIM = 128
+FF_DIM = 256               # 4x d_model (standard Transformer ratio)
 NUM_TRANSFORMER_LAYERS = 2
-DROPOUT_RATE = 0.3
+DROPOUT_RATE = 0.2          # Reduced: L2 + focal + label smoothing already regularize
 
 # ── ECG Patch Embedding ──────────────────────────────────────────────────────
 ECG_PATCH_SIZE = 8  # 64/8 = 8×8 = 64 patches
@@ -82,14 +82,14 @@ ECG_PATCH_SIZE = 8  # 64/8 = 8×8 = 64 patches
 # ── Training ──────────────────────────────────────────────────────────────────
 BATCH_SIZE = 32
 EPOCHS = 50
-LEARNING_RATE = 1e-3
-EARLY_STOPPING_PATIENCE = 10
+LEARNING_RATE = 5e-4           # Standard Transformer LR (1e-3 is too aggressive)
+EARLY_STOPPING_PATIENCE = 15   # Cosine decay makes late improvements smaller
 REDUCE_LR_PATIENCE = 5
 REDUCE_LR_FACTOR = 0.5
 RANDOM_SEED = 42
 
 # ── Data Augmentation ────────────────────────────────────────────────────────
-AUG_RATIO = 0.3             # Augment 30% extra copies of training data
+AUG_RATIO = 0.5             # Augment 50% extra copies of training data
 AUG_TIME_SHIFT_MAX = 10     # Max circular shift in time steps (EEG only)
 AUG_NOISE_STD = 0.01        # Gaussian noise standard deviation
 AUG_CHANNEL_DROP_PROB = 0.1 # Per-channel dropout probability (EEG only)
@@ -111,3 +111,8 @@ LABEL_SMOOTHING = 0.1          # Label smoothing factor (0 = off)
 USE_FOCAL_LOSS = True          # Use focal loss instead of crossentropy
 FOCAL_LOSS_GAMMA = 2.0         # Focusing parameter (higher = more focus on hard)
 FOCAL_LOSS_ALPHA = None        # Per-class weights (None = auto from class freq)
+
+# ── Optimizer ────────────────────────────────────────────────────────────────
+USE_ADAMW = True               # Use AdamW (decoupled weight decay) instead of Adam + L2
+ADAMW_WEIGHT_DECAY = 1e-4      # Weight decay coefficient for AdamW
+GRADIENT_CLIP_NORM = 1.0       # Global gradient norm clip (0 = disabled)

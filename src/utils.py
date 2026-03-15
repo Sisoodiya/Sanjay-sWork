@@ -63,7 +63,7 @@ def get_class_weights(labels):
     n_classes = len(counts)
     weights = {}
     for cls, count in counts.items():
-        weights[cls] = total / (n_classes * count)
+        weights[int(cls)] = total / (n_classes * count)
     return weights
 
 

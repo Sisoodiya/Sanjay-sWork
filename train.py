@@ -75,7 +75,7 @@ def losocv_train(target="valence", num_subjects=None, save_dir=None):
 
         # Steps per epoch for LR schedule
         n_train_total = count_training_samples(train_indices, target)
-        steps_per_epoch = n_train_total // config.BATCH_SIZE + 1
+        steps_per_epoch = n_train_total // config.BATCH_SIZE
 
         print(f"  Train: ~{n_train_total} samples (21 subjects + aug), "
               f"Val: {len(val_labels)} (subject {val_subject_idx}), "
@@ -146,8 +146,8 @@ def losocv_train(target="valence", num_subjects=None, save_dir=None):
         model.save_weights(os.path.join(save_dir, f"model_fold_{fold}.weights.h5"))
 
         # Clear session and free memory
-        del train_ds, val_eeg, val_ecg, val_labels_oh
-        del test_eeg, test_ecg, test_labels_oh
+        del train_ds, val_eeg, val_ecg, val_labels, val_labels_oh
+        del test_eeg, test_ecg, test_labels, test_labels_oh
         del model
         tf.keras.backend.clear_session()
         gc.collect()
@@ -177,9 +177,15 @@ def main():
                         help="Path to DREAMER.mat")
     args = parser.parse_args()
 
+    # Allow TF and CuPy to share GPU memory without conflicts
+    gpus = tf.config.list_physical_devices("GPU")
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+
     # Enable Mixed Precision to handle float16 inputs efficiently
     # and utilize the T4 GPU's Tensor Cores for massive speedups.
     tf.keras.mixed_precision.set_global_policy("mixed_float16")
+    print(f"GPU: {[g.name for g in gpus] if gpus else 'None (CPU only)'}")
     print("Enabled Mixed Precision (float16) for GPU Tensor Cores.")
 
     set_seed(config.RANDOM_SEED)

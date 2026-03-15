@@ -4,7 +4,8 @@ Phase 3: Full model assembly — Enhanced Att-1DCNN-GRU with TACO Cross-Attentio
 Combines EEG and ECG Transformer encoders with TACO fusion and a
 classification head for 3-class emotion prediction.
 
-Includes L2 regularization, focal loss, and configurable LR schedule.
+Supports AdamW (decoupled weight decay) with gradient clipping,
+skip connections from unimodal encoders, and mixed-precision-safe softmax.
 """
 
 import tensorflow as tf
@@ -26,9 +27,10 @@ def build_model(num_classes=None, d_model=None, num_heads=None, ff_dim=None,
         EEG Input (128, 9, 9) → EEGTransformerEncoder → (128, d_model)
         ECG Input (64, 64, 6)  → ECGTransformerEncoder → (64, d_model)
                                         ↓
-                              TACOCrossAttention
+                              TACOCrossAttention → fused (d_model)
+                              + skip: GAP(EEG) ⊕ GAP(ECG) → (3*d_model)
                                         ↓
-                              Dense(128, L2) → Dropout → Dense(num_classes, softmax)
+                              Dense(128) → Dropout → Dense(num_classes, softmax)
 
     Args:
         lr_schedule: Optional TF LearningRateSchedule (overrides learning_rate).
@@ -51,7 +53,8 @@ def build_model(num_classes=None, d_model=None, num_heads=None, ff_dim=None,
     if learning_rate is None:
         learning_rate = config.LEARNING_RATE
 
-    l2_reg = regularizers.l2(config.L2_WEIGHT_DECAY)
+    # L2 only when NOT using AdamW (AdamW has decoupled weight decay)
+    l2_reg = regularizers.l2(config.L2_WEIGHT_DECAY) if not config.USE_ADAMW else None
 
     # ── Inputs ────────────────────────────────────────────────────────────
     eeg_input = layers.Input(
@@ -84,12 +87,18 @@ def build_model(num_classes=None, d_model=None, num_heads=None, ff_dim=None,
     )
     fused = taco(eeg_features, ecg_features)  # (batch, d_model)
 
-    # ── Classification Head (with L2 regularization) ─────────────────────
+    # ── Skip Connections: preserve unimodal features ─────────────────────
+    eeg_pooled = layers.GlobalAveragePooling1D(name="eeg_skip_pool")(eeg_features)
+    ecg_pooled = layers.GlobalAveragePooling1D(name="ecg_skip_pool")(ecg_features)
+    combined = layers.Concatenate(name="skip_concat")([fused, eeg_pooled, ecg_pooled])
+
+    # ── Classification Head ──────────────────────────────────────────────
     x = layers.Dense(128, activation="relu", kernel_regularizer=l2_reg,
-                     name="cls_dense1")(fused)
+                     name="cls_dense1")(combined)
     x = layers.Dropout(dropout, name="cls_dropout")(x)
-    output = layers.Dense(num_classes, activation="softmax",
-                          kernel_regularizer=l2_reg, name="cls_output")(x)
+    # Separate logits/softmax for mixed precision stability
+    logits = layers.Dense(num_classes, name="cls_output", dtype="float32")(x)
+    output = layers.Activation("softmax", dtype="float32", name="cls_softmax")(logits)
 
     # ── Loss ──────────────────────────────────────────────────────────────
     if config.USE_FOCAL_LOSS:
@@ -106,9 +115,20 @@ def build_model(num_classes=None, d_model=None, num_heads=None, ff_dim=None,
     else:
         loss_fn = "categorical_crossentropy"
 
-    # ── Optimizer (with optional LR schedule) ─────────────────────────────
+    # ── Optimizer ─────────────────────────────────────────────────────────
     opt_lr = lr_schedule if lr_schedule is not None else learning_rate
-    optimizer = tf.keras.optimizers.Adam(learning_rate=opt_lr)
+    clip = config.GRADIENT_CLIP_NORM if config.GRADIENT_CLIP_NORM > 0 else None
+    if config.USE_ADAMW:
+        optimizer = tf.keras.optimizers.AdamW(
+            learning_rate=opt_lr,
+            weight_decay=config.ADAMW_WEIGHT_DECAY,
+            clipnorm=clip,
+        )
+    else:
+        optimizer = tf.keras.optimizers.Adam(
+            learning_rate=opt_lr,
+            clipnorm=clip,
+        )
 
     # ── Compile ───────────────────────────────────────────────────────────
     model = Model(inputs=[eeg_input, ecg_input], outputs=output, name="TACO_Emotion_Model")

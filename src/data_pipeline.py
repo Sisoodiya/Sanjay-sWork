@@ -133,7 +133,7 @@ def _training_generator(train_subject_indices, target, subjects_dir,
     Subject order and within-subject sample order are shuffled each
     time the generator is called (each epoch).
     """
-    rng = np.random.RandomState()
+    rng = np.random.RandomState(config.RANDOM_SEED)
     shuffled_subjects = list(rng.permutation(train_subject_indices))
 
     for subj_idx in shuffled_subjects:
@@ -195,7 +195,7 @@ def make_training_dataset(train_subject_indices, target, batch_size=None,
     # 2000 samples * ~70 KB = ~140 MB — good mixing for ~1080 segs/subject.
     ds = ds.shuffle(buffer_size=config.SHUFFLE_BUFFER_SIZE,
                     reshuffle_each_iteration=True)
-    ds = ds.batch(batch_size)
+    ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
 
     return ds

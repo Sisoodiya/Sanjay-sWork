@@ -70,10 +70,15 @@ class CategoricalFocalLoss(tf.keras.losses.Loss):
         # Cross-entropy component: -y_true * log(y_pred)
         ce = -y_true * tf.math.log(y_pred)
 
-        # Focal modulation: (1 - p_t)^gamma
-        modulating_factor = tf.pow(1.0 - y_pred, self.gamma)
+        # Focal modulation based on p_t (probability of the target distribution)
+        # Using p_t = sum(y_true * y_pred) gives a per-sample modulating factor,
+        # which correctly handles label smoothing (where y_true is non-zero for
+        # all classes). Per-element (1 - y_pred)^gamma would leave the smoothed
+        # non-true class terms unmodulated since y_pred ≈ 0 → factor ≈ 1.
+        p_t = tf.reduce_sum(y_true * y_pred, axis=-1, keepdims=True)  # (batch, 1)
+        modulating_factor = tf.pow(1.0 - p_t, self.gamma)
 
-        # Apply focal modulation
+        # Apply focal modulation (shared factor per sample across all classes)
         focal_loss = modulating_factor * ce
 
         # Apply per-class alpha weights
